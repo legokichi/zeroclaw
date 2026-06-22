@@ -42,6 +42,8 @@ pub struct SlackChannel {
     workspace_dir: Option<PathBuf>,
     /// Maps channel_id -> thread_ts for active assistant threads (used for status indicators).
     active_assistant_thread: Mutex<HashMap<String, String>>,
+    /// Tracks Slack threads where this assistant has been explicitly activated.
+    active_assistant_threads: Mutex<HashSet<String>>,
     /// Threads (`thread_ts`) for which we have already prepended a
     /// `[Thread context]` backfill block. In-memory only — after a
     /// process restart the set is empty and each active thread sees one
@@ -270,6 +272,7 @@ impl SlackChannel {
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
             active_assistant_thread: Mutex::new(HashMap::new()),
+            active_assistant_threads: Mutex::new(HashSet::new()),
             seen_threads: Mutex::new(HashSet::new()),
             use_markdown_blocks: false,
             proxy_url: None,
@@ -885,6 +888,50 @@ impl SlackChannel {
         self.group_reply_allowed_sender_ids
             .iter()
             .any(|entry| entry == "*" || entry == user_id)
+    }
+
+    fn assistant_thread_key(channel_id: &str, thread_ts: &str) -> String {
+        format!("{channel_id}:{thread_ts}")
+    }
+
+    fn is_assistant_thread_active(&self, channel_id: &str, thread_ts: Option<&str>) -> bool {
+        let Some(thread_ts) = thread_ts.filter(|value| !value.is_empty()) else {
+            return false;
+        };
+        let key = Self::assistant_thread_key(channel_id, thread_ts);
+        self.active_assistant_threads
+            .lock()
+            .map(|threads| threads.contains(&key))
+            .unwrap_or(false)
+    }
+
+    fn remember_assistant_thread(&self, channel_id: &str, thread_ts: Option<&str>) {
+        let Some(thread_ts) = thread_ts.filter(|value| !value.is_empty()) else {
+            return;
+        };
+        if let Ok(mut map) = self.active_assistant_thread.lock() {
+            map.insert(channel_id.to_string(), thread_ts.to_string());
+        }
+        if let Ok(mut threads) = self.active_assistant_threads.lock() {
+            threads.insert(Self::assistant_thread_key(channel_id, thread_ts));
+        }
+    }
+
+    fn should_require_group_mention(
+        &self,
+        is_group_message: bool,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        allow_sender_without_mention: bool,
+    ) -> bool {
+        if !self.mention_only || !is_group_message || allow_sender_without_mention {
+            return false;
+        }
+        let Some(thread_ts) = thread_ts.filter(|value| !value.is_empty()) else {
+            return true;
+        };
+        self.strict_mention_in_thread
+            || !self.is_assistant_thread_active(channel_id, Some(thread_ts))
     }
 
     fn outbound_thread_ts<'a>(&self, message: &'a SendMessage) -> Option<&'a str> {
@@ -3706,11 +3753,8 @@ impl SlackChannel {
                             .get("thread_ts")
                             .and_then(|v| v.as_str())
                             .unwrap_or_default();
-                        if !ch.is_empty()
-                            && !tts.is_empty()
-                            && let Ok(mut map) = self.active_assistant_thread.lock()
-                        {
-                            map.insert(ch.to_string(), tts.to_string());
+                        if !ch.is_empty() && !tts.is_empty() {
+                            self.remember_assistant_thread(ch, Some(tts));
                         }
                     }
                     continue;
@@ -3840,13 +3884,19 @@ impl SlackChannel {
                 }
 
                 let is_group_message = Self::is_group_channel_id(&channel_id);
-                let is_thread_reply = event.get("thread_ts").and_then(|v| v.as_str()).is_some();
+                let inbound_thread_ts = if self.thread_replies {
+                    Self::inbound_thread_ts(event, ts)
+                } else {
+                    Self::inbound_thread_ts_genuine_only(event)
+                };
                 let allow_sender_without_mention =
                     is_group_message && self.is_group_sender_trigger_enabled(user);
-                let require_mention = self.mention_only
-                    && is_group_message
-                    && !allow_sender_without_mention
-                    && (!is_thread_reply || self.strict_mention_in_thread);
+                let require_mention = self.should_require_group_mention(
+                    is_group_message,
+                    &channel_id,
+                    inbound_thread_ts.as_deref(),
+                    allow_sender_without_mention,
+                );
 
                 let Some(normalized_text) = self
                     .build_incoming_content(event, &channel_id, require_mention, bot_user_id)
@@ -3878,11 +3928,7 @@ impl SlackChannel {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
-                    thread_ts: if self.thread_replies {
-                        Self::inbound_thread_ts(event, ts)
-                    } else {
-                        Self::inbound_thread_ts_genuine_only(event)
-                    },
+                    thread_ts: inbound_thread_ts,
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                     attachments: vec![],
                     subject: None,
@@ -3891,11 +3937,7 @@ impl SlackChannel {
                 };
 
                 // Track thread context so start_typing can set assistant status.
-                if let Some(ref tts) = channel_msg.thread_ts
-                    && let Ok(mut map) = self.active_assistant_thread.lock()
-                {
-                    map.insert(channel_id.clone(), tts.clone());
-                }
+                self.remember_assistant_thread(&channel_id, channel_msg.thread_ts.as_deref());
 
                 if tx.send(channel_msg).await.is_err() {
                     return Ok(());
@@ -5026,14 +5068,19 @@ impl Channel for SlackChannel {
                         }
 
                         let is_group_message = Self::is_group_channel_id(&channel_id);
-                        let is_thread_reply =
-                            msg.get("thread_ts").and_then(|v| v.as_str()).is_some();
+                        let inbound_thread_ts = if self.thread_replies {
+                            Self::inbound_thread_ts(msg, ts)
+                        } else {
+                            Self::inbound_thread_ts_genuine_only(msg)
+                        };
                         let allow_sender_without_mention =
                             is_group_message && self.is_group_sender_trigger_enabled(user);
-                        let require_mention = self.mention_only
-                            && is_group_message
-                            && !allow_sender_without_mention
-                            && (!is_thread_reply || self.strict_mention_in_thread);
+                        let require_mention = self.should_require_group_mention(
+                            is_group_message,
+                            &channel_id,
+                            inbound_thread_ts.as_deref(),
+                            allow_sender_without_mention,
+                        );
                         let Some(normalized_text) = self
                             .build_incoming_content(msg, &channel_id, require_mention, &bot_user_id)
                             .await
@@ -5065,17 +5112,18 @@ impl Channel for SlackChannel {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs(),
-                            thread_ts: if self.thread_replies {
-                                Self::inbound_thread_ts(msg, ts)
-                            } else {
-                                Self::inbound_thread_ts_genuine_only(msg)
-                            },
+                            thread_ts: inbound_thread_ts,
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
                             attachments: vec![],
                             subject: None,
 
                             ..Default::default()
                         };
+
+                        self.remember_assistant_thread(
+                            &channel_id,
+                            channel_msg.thread_ts.as_deref(),
+                        );
 
                         if tx.send(channel_msg).await.is_err() {
                             return Ok(());
@@ -5126,9 +5174,15 @@ impl Channel for SlackChannel {
                         continue;
                     }
 
-                    // Thread replies never require a mention — we always respond
-                    // inside threads the bot is already participating in.
-                    let require_mention = false;
+                    let is_group_message = Self::is_group_channel_id(&thread_channel_id);
+                    let allow_sender_without_mention =
+                        is_group_message && self.is_group_sender_trigger_enabled(user);
+                    let require_mention = self.should_require_group_mention(
+                        is_group_message,
+                        &thread_channel_id,
+                        Some(&thread_ts),
+                        allow_sender_without_mention,
+                    );
                     let Some(normalized_text) = self
                         .build_incoming_content(
                             reply,
@@ -5179,6 +5233,8 @@ impl Channel for SlackChannel {
 
                         ..Default::default()
                     };
+
+                    self.remember_assistant_thread(&thread_channel_id, Some(&thread_ts));
 
                     if tx.send(channel_msg).await.is_err() {
                         return Ok(());
@@ -6863,6 +6919,42 @@ mod tests {
             assert_eq!(map.get("C123"), Some(&"1741234567.000100".to_string()),);
             assert_eq!(map.get("C999"), None);
         }
+    }
+
+    #[test]
+    fn thread_replies_need_mention_until_assistant_thread_is_active() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        )
+        .with_group_reply_policy(true, Vec::new());
+
+        assert!(ch.should_require_group_mention(true, "C123", Some("T123"), false));
+
+        ch.remember_assistant_thread("C123", Some("T123"));
+
+        assert!(!ch.should_require_group_mention(true, "C123", Some("T123"), false));
+        assert!(ch.should_require_group_mention(true, "C123", Some("T999"), false));
+    }
+
+    #[test]
+    fn strict_mention_in_thread_overrides_active_assistant_thread() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        )
+        .with_group_reply_policy(true, Vec::new())
+        .with_strict_mention_in_thread(true);
+
+        ch.remember_assistant_thread("C123", Some("T123"));
+
+        assert!(ch.should_require_group_mention(true, "C123", Some("T123"), false));
     }
 
     #[test]
