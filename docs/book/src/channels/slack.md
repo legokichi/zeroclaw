@@ -88,9 +88,17 @@ secure.
 
 {{#thread-context channel="Slack" prop="thread_replies" path="channels.slack.<alias>.thread_replies"}}
 
-`strict_mention_in_thread` tightens this further: when `true`, the bot only
-answers inside a thread if a message there @-mentions it, instead of replying to
-every message in a thread it's part of.
+When `mention_only = true`, Slack group messages must @-mention the bot to
+start a turn. After the bot has been activated in a thread, follow-up replies in
+that same thread can continue without repeating the mention. Set
+`strict_mention_in_thread = true` to require an @-mention for every thread reply
+too.
+
+`thread_history_scope` controls which Slack messages share one conversation
+history. The default `sender` preserves the historical behavior: a thread is
+split by sender. Set it to `thread` for support-style bots where everyone in
+the same Slack thread should share context, or `channel` to reuse one history
+across the whole Slack channel.
 
 ## Mentions and formatting
 

@@ -12922,6 +12922,22 @@ impl ChannelConfig for DiscordConfig {
     }
 }
 
+/// Scope used for Slack channel conversation history.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SlackThreadHistoryScope {
+    /// Preserve the existing behavior: isolate history by Slack sender, channel, and thread.
+    #[default]
+    Sender,
+    /// Share history across all senders in the same Slack thread.
+    Thread,
+    /// Share history across all senders and threads in the same Slack channel.
+    Channel,
+}
+
 /// Slack bot channel configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -12972,6 +12988,13 @@ pub struct SlackConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub thread_replies: Option<bool>,
+    /// Controls which Slack messages share conversation history.
+    /// `sender` keeps the historical ZeroClaw behavior (channel + thread + sender).
+    /// `thread` shares one history across everyone in the same Slack thread.
+    /// `channel` shares one history across the whole Slack channel.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub thread_history_scope: SlackThreadHistoryScope,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages remain allowed.
     #[tab(Behavior)]
@@ -12979,8 +13002,9 @@ pub struct SlackConfig {
     pub mention_only: bool,
     /// When true (and `mention_only` is also true), messages inside a Slack
     /// thread must also @-mention the bot to trigger a response. By default,
-    /// thread replies are allowed through without a mention so the bot can
-    /// keep a back-and-forth going without the user repeating @-mentions.
+    /// replies in a thread where the bot has already been activated are allowed
+    /// through without a mention so the bot can keep a back-and-forth going
+    /// without the user repeating @-mentions.
     /// Set this to true in channels shared with human discussion where the
     /// bot should stay silent unless explicitly addressed.
     #[tab(Advanced)]
@@ -24069,6 +24093,14 @@ allowed_users = ["U111"]
         assert_eq!(parsed.thread_replies, Some(false));
         assert!(!parsed.interrupt_on_new_message);
         assert!(!parsed.mention_only);
+        assert_eq!(parsed.thread_history_scope, SlackThreadHistoryScope::Sender);
+    }
+
+    #[test]
+    async fn slack_config_deserializes_thread_history_scope() {
+        let json = r#"{"bot_token":"xoxb-tok","thread_history_scope":"thread"}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.thread_history_scope, SlackThreadHistoryScope::Thread);
     }
 
     #[test]
@@ -24106,6 +24138,20 @@ channel_ids = ["C123", "D456"]
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.thread_replies, None);
         assert!(!parsed.mention_only);
+        assert_eq!(parsed.thread_history_scope, SlackThreadHistoryScope::Sender);
+    }
+
+    #[test]
+    async fn slack_config_toml_with_thread_history_scope() {
+        let toml_str = r#"
+bot_token = "xoxb-tok"
+thread_history_scope = "channel"
+"#;
+        let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            parsed.thread_history_scope,
+            SlackThreadHistoryScope::Channel
+        );
     }
 
     #[test]
