@@ -637,6 +637,12 @@ pub struct Config {
     #[group = "Integrations"]
     pub opencode_cli: OpenCodeCliConfig,
 
+    /// Grok Build CLI tool configuration (`[grok_cli]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Integrations"]
+    pub grok_cli: GrokCliConfig,
+
     /// Standard Operating Procedures engine configuration (`[sop]`).
     #[serde(default)]
     #[nested]
@@ -9044,6 +9050,78 @@ impl Default for OpenCodeCliConfig {
     }
 }
 
+// ── Grok Build CLI ─────────────────────────────────────────────
+
+/// Grok Build CLI tool configuration (`[grok_cli]` section).
+///
+/// Delegates coding tasks to the `grok -p` headless CLI. Authentication uses
+/// the binary's own session by default — no API key needed unless
+/// `env_passthrough` includes `XAI_API_KEY`.
+///
+/// See <https://docs.x.ai/build/cli/headless-scripting>.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "grok_cli"]
+pub struct GrokCliConfig {
+    /// Enable the `grok_cli` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum execution time in seconds (coding tasks can be long)
+    #[serde(default = "default_grok_cli_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum output size in bytes (2MB default)
+    #[serde(default = "default_grok_cli_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Extra env vars passed to the grok subprocess (e.g. XAI_API_KEY)
+    #[serde(default)]
+    #[credential_class = "legacy_env_path"]
+    pub env_passthrough: Vec<String>,
+    /// Extra CLI arguments appended to `grok -p` after built-in flags.
+    ///
+    /// Values come from operator-controlled config (same trust level as
+    /// `env_passthrough`) and are not validated — the operator is responsible
+    /// for understanding the implications of flags passed here.
+    ///
+    /// Example: `["--max-turns=40", "--no-plan"]`
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    /// When true (default), pass `--always-approve` and
+    /// `--permission-mode bypassPermissions` so headless runs do not block on
+    /// interactive permission prompts.
+    #[serde(default = "default_grok_cli_auto_approve")]
+    pub auto_approve: bool,
+    /// Optional default model ID (e.g. `"grok-4.5"`). Overridable per call via
+    /// the tool's `model` parameter.
+    #[serde(default)]
+    pub default_model: Option<String>,
+}
+
+fn default_grok_cli_timeout_secs() -> u64 {
+    600
+}
+
+fn default_grok_cli_max_output_bytes() -> usize {
+    2_097_152
+}
+
+fn default_grok_cli_auto_approve() -> bool {
+    true
+}
+
+impl Default for GrokCliConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_grok_cli_timeout_secs(),
+            max_output_bytes: default_grok_cli_max_output_bytes(),
+            env_passthrough: Vec::new(),
+            extra_args: Vec::new(),
+            auto_approve: default_grok_cli_auto_approve(),
+            default_model: None,
+        }
+    }
+}
+
 // ── Proxy ───────────────────────────────────────────────────────
 
 /// Proxy application scope — determines which outbound traffic uses the proxy.
@@ -17032,6 +17110,7 @@ impl Default for Config {
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
+            grok_cli: GrokCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
@@ -23745,6 +23824,7 @@ auto_save = true
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
+            grok_cli: GrokCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
@@ -24457,6 +24537,7 @@ default_temperature = 0.7
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
+            grok_cli: GrokCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),

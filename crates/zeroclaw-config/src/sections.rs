@@ -1054,6 +1054,7 @@ mod tests {
             ("codex_cli", SectionGroup::Integrations),
             ("gemini_cli", SectionGroup::Integrations),
             ("opencode_cli", SectionGroup::Integrations),
+            ("grok_cli", SectionGroup::Integrations),
             ("sop", SectionGroup::Agent),
             ("verifiable_intent", SectionGroup::Agent),
             ("shell_tool", SectionGroup::Tools),
