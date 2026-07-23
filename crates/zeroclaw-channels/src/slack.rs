@@ -95,6 +95,7 @@ const SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES: usize = 256 * 1024;
 const SLACK_ATTACHMENT_TEXT_INLINE_MAX_CHARS: usize = 12_000;
 const SLACK_MARKDOWN_BLOCK_MAX_CHARS: usize = 12_000;
 const SLACK_BLOCK_TEXT_MAX_CHARS: usize = 3_000;
+const SLACK_TOP_LEVEL_TEXT_MAX_CHARS: usize = 4_000;
 const SLACK_MAX_BLOCKS_PER_MESSAGE: usize = 50;
 const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
 const SLACK_USER_CACHE_MAX_ENTRIES: usize = 1000;
@@ -104,6 +105,174 @@ const SLACK_OUTBOUND_ATTACHMENT_MAX_BYTES: usize = 20 * 1024 * 1024;
 const SLACK_PERMALINK_MAX_LINKS_PER_MESSAGE: usize = 3;
 const SLACK_PERMALINK_THREAD_MAX_REPLIES: usize = 20;
 const SLACK_PERMALINK_TEXT_MAX_CHARS: usize = 8_000;
+
+fn add_slack_text_blocks(body: &mut serde_json::Value, text: &str, use_markdown_blocks: bool) {
+    if text.len() > SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+        return;
+    }
+
+    if !use_markdown_blocks {
+        add_slack_section_blocks(body, text);
+        return;
+    }
+
+    let blocks = split_text_into_chunks(
+        text,
+        SLACK_MARKDOWN_BLOCK_MAX_CHARS,
+        SLACK_MAX_BLOCKS_PER_MESSAGE,
+    )
+    .into_iter()
+    .map(|chunk| {
+        serde_json::json!({
+            "type": "markdown",
+            "text": chunk
+        })
+    })
+    .collect();
+    body["blocks"] = serde_json::Value::Array(blocks);
+}
+
+fn add_slack_section_blocks(body: &mut serde_json::Value, text: &str) {
+    let blocks = split_text_into_chunks(
+        text,
+        SLACK_BLOCK_TEXT_MAX_CHARS,
+        SLACK_MAX_BLOCKS_PER_MESSAGE,
+    )
+    .into_iter()
+    .map(|chunk| {
+        serde_json::json!({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": chunk
+            }
+        })
+    })
+    .collect();
+    body["blocks"] = serde_json::Value::Array(blocks);
+}
+
+fn slack_top_level_text(text: &str) -> String {
+    split_text_into_chunks(text, SLACK_TOP_LEVEL_TEXT_MAX_CHARS, 1)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+fn is_slack_block_payload_error(error: &str) -> bool {
+    matches!(
+        error,
+        "invalid_blocks"
+            | "invalid_blocks_format"
+            | "msg_blocks_too_long"
+            | "msg_blocks_too_many"
+            | "msg_too_long"
+    )
+}
+
+async fn send_slack_json_request(
+    client: &reqwest::Client,
+    token: &str,
+    url: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<(reqwest::StatusCode, String)> {
+    let response = client
+        .post(url)
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await?;
+    let status = response.status();
+    let raw = response
+        .text()
+        .await
+        .context("failed to read Slack API response body")?;
+    Ok((status, raw))
+}
+
+fn validate_slack_json_response(
+    api_method: &str,
+    status: reqwest::StatusCode,
+    raw: &str,
+) -> anyhow::Result<serde_json::Value> {
+    if !status.is_success() {
+        let sanitized = zeroclaw_providers::sanitize_api_error(raw);
+        anyhow::bail!("{api_method} failed ({status}): {sanitized}");
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).with_context(|| format!("{api_method} returned invalid JSON"))?;
+    if parsed.get("ok") != Some(&serde_json::Value::Bool(true)) {
+        let error = parsed
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        anyhow::bail!("{api_method} failed: {error}");
+    }
+
+    Ok(parsed)
+}
+
+async fn post_slack_json_with_block_fallback(
+    client: &reqwest::Client,
+    token: &str,
+    url: &str,
+    api_method: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let mut request_body = body.clone();
+    if request_body.get("blocks").is_some()
+        && let Some(text) = body.get("text").and_then(|value| value.as_str())
+    {
+        request_body["text"] = serde_json::json!(slack_top_level_text(text));
+    }
+
+    let (status, raw) = send_slack_json_request(client, token, url, &request_body).await?;
+    let block_error = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .get("error")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        });
+
+    if body.get("blocks").is_some()
+        && block_error
+            .as_deref()
+            .is_some_and(is_slack_block_payload_error)
+    {
+        let mut fallback_body = body.clone();
+        fallback_body
+            .as_object_mut()
+            .context("Slack API request body must be an object")?
+            .remove("blocks");
+        let text = body
+            .get("text")
+            .and_then(|value| value.as_str())
+            .context("Slack block fallback requires top-level text")?;
+        add_slack_section_blocks(&mut fallback_body, text);
+        fallback_body["text"] = serde_json::json!(slack_top_level_text(text));
+
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "api": api_method,
+                    "error": block_error,
+                    "error_key": "slack_block_payload_rejected",
+                })),
+            "Slack rejected block payload; retrying with section blocks"
+        );
+
+        let (fallback_status, fallback_raw) =
+            send_slack_json_request(client, token, url, &fallback_body).await?;
+        return validate_slack_json_response(api_method, fallback_status, &fallback_raw);
+    }
+
+    validate_slack_json_response(api_method, status, &raw)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SlackPermalinkRef {
@@ -481,32 +650,21 @@ impl SlackChannel {
             "channel": channel_id,
             "text": text,
         });
-        if text.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
-            body["blocks"] = serde_json::json!([{
-                "type": "markdown",
-                "text": text
-            }]);
-        }
+        add_slack_text_blocks(&mut body, text, self.use_markdown_blocks);
         if let Some(ts) = thread_ts {
             body["thread_ts"] = serde_json::json!(ts);
         }
 
-        let resp = self
-            .http_client()
-            .post("https://slack.com/api/chat.postMessage")
-            .bearer_auth(&self.bot_token)
-            .json(&body)
-            .send()
-            .await?;
-
-        let resp_body: serde_json::Value = resp.json().await?;
-        if resp_body.get("ok") != Some(&serde_json::Value::Bool(true)) {
-            let err = resp_body
-                .get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("unknown");
-            anyhow::bail!("chat.postMessage (lazy draft) failed: {err}");
-        }
+        let client = self.http_client();
+        let url = self.slack_api_url("chat.postMessage");
+        let resp_body = post_slack_json_with_block_fallback(
+            &client,
+            &self.bot_token,
+            &url,
+            "chat.postMessage (lazy draft)",
+            &body,
+        )
+        .await?;
 
         let ts = resp_body
             .get("ts")
@@ -4426,42 +4584,10 @@ impl Channel for SlackChannel {
                 "text": cleaned_content.clone()
             });
 
-            // Add rich formatting blocks, split into chunks for the per-block limit.
-            // The newer `markdown` block type (12k chars) offers richer formatting but
-            // isn't available on all workspaces, causing `invalid_blocks` errors.
-            // Default to the universally supported `section` block with `mrkdwn`.
-            let block_limit = if self.use_markdown_blocks {
-                SLACK_MARKDOWN_BLOCK_MAX_CHARS
-            } else {
-                SLACK_BLOCK_TEXT_MAX_CHARS
-            };
-            if cleaned_content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
-                let chunks = split_text_into_chunks(
-                    &cleaned_content,
-                    block_limit,
-                    SLACK_MAX_BLOCKS_PER_MESSAGE,
-                );
-                let blocks: Vec<serde_json::Value> = chunks
-                    .into_iter()
-                    .map(|chunk| {
-                        if self.use_markdown_blocks {
-                            serde_json::json!({
-                                "type": "markdown",
-                                "text": chunk
-                            })
-                        } else {
-                            serde_json::json!({
-                                "type": "section",
-                                "text": {
-                                    "type": "mrkdwn",
-                                    "text": chunk
-                                }
-                            })
-                        }
-                    })
-                    .collect();
-                body["blocks"] = serde_json::Value::Array(blocks);
-            }
+            // Slack may translate one `markdown` block into many Block Kit blocks.
+            // The API response remains the authority on whether the rendered payload
+            // fits; block-limit errors are retried below with bounded section blocks.
+            add_slack_text_blocks(&mut body, &cleaned_content, self.use_markdown_blocks);
 
             if let Some(ts) = thread_ts {
                 body["thread_ts"] = serde_json::json!(ts);
@@ -4469,34 +4595,16 @@ impl Channel for SlackChannel {
             body
         };
 
-        let resp = self
-            .http_client()
-            .post(self.slack_api_url("chat.postMessage"))
-            .bearer_auth(&self.bot_token)
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-
-        if !status.is_success() {
-            let sanitized = zeroclaw_providers::sanitize_api_error(&body);
-            anyhow::bail!("chat.postMessage failed ({status}): {sanitized}");
-        }
-
-        // Slack returns 200 for most app-level errors; check JSON "ok" field
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            let err = parsed
-                .get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("unknown");
-            anyhow::bail!("chat.postMessage failed: {err}");
-        }
+        let client = self.http_client();
+        let url = self.slack_api_url("chat.postMessage");
+        post_slack_json_with_block_fallback(
+            &client,
+            &self.bot_token,
+            &url,
+            "chat.postMessage",
+            &body,
+        )
+        .await?;
 
         if !outbound_attachments.is_empty() {
             self.upload_outbound_attachments(&message.recipient, thread_ts, &outbound_attachments)
@@ -4534,7 +4642,7 @@ impl Channel for SlackChannel {
         {
             // First call — post the message. This blocks intentionally so the
             // ts is stored before any subsequent update_draft or finalize_draft.
-            let _ = self.materialize_lazy_draft(message_id, text).await;
+            self.materialize_lazy_draft(message_id, text).await?;
             self.last_draft_edit
                 .lock()
                 .expect("last_draft_edit lock")
@@ -4582,52 +4690,30 @@ impl Channel for SlackChannel {
         let client = self.http_client();
         let token = self.bot_token.clone();
         let channel = recipient.to_string();
+        let url = self.slack_api_url("chat.update");
+        let use_markdown_blocks = self.use_markdown_blocks;
         zeroclaw_spawn::spawn!(async move {
             let mut body = serde_json::json!({
                 "channel": channel,
                 "ts": real_ts,
                 "text": &display_text,
             });
-            if display_text.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
-                body["blocks"] = serde_json::json!([{
-                    "type": "markdown",
-                    "text": &display_text
-                }]);
-            }
-            match client
-                .post("https://slack.com/api/chat.update")
-                .bearer_auth(&token)
-                .json(&body)
-                .send()
-                .await
+            add_slack_text_blocks(&mut body, &display_text, use_markdown_blocks);
+            if let Err(error) = post_slack_json_with_block_fallback(
+                &client,
+                &token,
+                &url,
+                "chat.update (draft)",
+                &body,
+            )
+            .await
             {
-                Ok(resp) => {
-                    if let Ok(resp_body) = resp.json::<serde_json::Value>().await
-                        && resp_body.get("ok") != Some(&serde_json::Value::Bool(true))
-                    {
-                        let err = resp_body
-                            .get("error")
-                            .and_then(|e| e.as_str())
-                            .unwrap_or("unknown");
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                            "chat.update (draft) failed"
-                        );
-                    }
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "chat.update (draft) HTTP error"
-                    );
-                }
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", error)})),
+                    "chat.update (draft) failed"
+                );
             }
         });
 
@@ -4695,36 +4781,27 @@ impl Channel for SlackChannel {
             "text": text,
         });
 
-        // Use markdown blocks for rich formatting when it fits
-        if text.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
-            body["blocks"] = serde_json::json!([{
-                "type": "markdown",
-                "text": text
-            }]);
-        }
+        add_slack_text_blocks(&mut body, text, self.use_markdown_blocks);
 
-        let resp = self
-            .http_client()
-            .post("https://slack.com/api/chat.update")
-            .bearer_auth(&self.bot_token)
-            .json(&body)
-            .send()
-            .await?;
-
-        let resp_body: serde_json::Value = resp.json().await?;
-        if resp_body.get("ok") == Some(&serde_json::Value::Bool(true)) {
+        let client = self.http_client();
+        let url = self.slack_api_url("chat.update");
+        let Err(error) = post_slack_json_with_block_fallback(
+            &client,
+            &self.bot_token,
+            &url,
+            "chat.update (finalize)",
+            &body,
+        )
+        .await
+        else {
             return Ok(());
-        }
+        };
 
-        // Fallback: delete draft and send fresh
-        let err = resp_body
-            .get("error")
-            .and_then(|e| e.as_str())
-            .unwrap_or("unknown");
+        // Fallback for non-block-related update failures: delete draft and send fresh.
         ::zeroclaw_log::record!(
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                .with_attrs(::serde_json::json!({"error": format!("{}", error)})),
             "chat.update (finalize) failed; falling back to delete+send"
         );
 
@@ -6027,6 +6104,202 @@ mod tests {
         )
         .with_workspace_dir(workspace.to_path_buf())
         .with_api_base_url(server.uri())
+    }
+
+    fn structured_markdown_response() -> String {
+        let mut text = "## Component\n- **State:** ready\n- **Owner:** project_bot\n\n".repeat(128);
+        text.truncate(5_808);
+        text
+    }
+
+    #[tokio::test]
+    async fn send_retries_rejected_markdown_as_section_blocks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let responder_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if responder_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "ok": false,
+                        "error": "invalid_blocks",
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "ok": true,
+                        "ts": "zeroclaw_message",
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let channel = test_slack_channel(&server, tmp.path()).with_markdown_blocks(true);
+        let content = structured_markdown_response();
+        let message = SendMessage::new(&content, "zeroclaw_channel")
+            .in_thread(Some("zeroclaw_thread".to_string()));
+
+        SlackChannel::send(&channel, &message).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let posts: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/chat.postMessage")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0]["blocks"][0]["type"], "markdown");
+        assert!(posts[0]["text"].as_str().unwrap().len() <= SLACK_TOP_LEVEL_TEXT_MAX_CHARS);
+        assert_eq!(posts[0]["blocks"][0]["text"], content);
+        assert_eq!(posts[0]["thread_ts"], "zeroclaw_thread");
+
+        let fallback_blocks = posts[1]["blocks"].as_array().unwrap();
+        assert!(
+            fallback_blocks
+                .iter()
+                .all(|block| block["type"] == "section")
+        );
+        assert!(fallback_blocks.iter().all(|block| {
+            block["text"]["text"].as_str().unwrap().len() <= SLACK_BLOCK_TEXT_MAX_CHARS
+        }));
+        let fallback_text: String = fallback_blocks
+            .iter()
+            .map(|block| block["text"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(fallback_text, content);
+        assert!(posts[1]["text"].as_str().unwrap().len() <= SLACK_TOP_LEVEL_TEXT_MAX_CHARS);
+        assert_eq!(posts[1]["thread_ts"], "zeroclaw_thread");
+    }
+
+    #[tokio::test]
+    async fn lazy_draft_materialization_retries_rejected_markdown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let responder_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if responder_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "ok": false,
+                        "error": "invalid_blocks",
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "ok": true,
+                        "ts": "zeroclaw_message",
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let channel = test_slack_channel(&server, tmp.path())
+            .with_markdown_blocks(true)
+            .with_streaming(true, 1);
+        let lazy_id = "lazy:zeroclaw_channel:zeroclaw_thread";
+
+        channel
+            .update_draft("zeroclaw_channel", lazy_id, &structured_markdown_response())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            channel.resolve_draft_ts(lazy_id).await.as_deref(),
+            Some("zeroclaw_message")
+        );
+        let requests = server.received_requests().await.unwrap();
+        let posts: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/chat.postMessage")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0]["blocks"][0]["type"], "markdown");
+        assert!(
+            posts[1]["blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] == "section")
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_retries_rejected_markdown_as_section_blocks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let responder_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/chat.update"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if responder_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "ok": false,
+                        "error": "msg_blocks_too_long",
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "ok": true,
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let channel = test_slack_channel(&server, tmp.path()).with_markdown_blocks(true);
+        let content = structured_markdown_response();
+
+        channel
+            .finalize_draft("zeroclaw_channel", "zeroclaw_message", &content, false)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let updates: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/chat.update")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0]["blocks"][0]["type"], "markdown");
+        assert!(updates[0]["text"].as_str().unwrap().len() <= SLACK_TOP_LEVEL_TEXT_MAX_CHARS);
+        let fallback_blocks = updates[1]["blocks"].as_array().unwrap();
+        assert!(
+            fallback_blocks
+                .iter()
+                .all(|block| block["type"] == "section")
+        );
+        let fallback_text: String = fallback_blocks
+            .iter()
+            .map(|block| block["text"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(fallback_text, content);
+        assert!(updates[1]["text"].as_str().unwrap().len() <= SLACK_TOP_LEVEL_TEXT_MAX_CHARS);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/chat.postMessage")
+        );
     }
 
     #[tokio::test]
