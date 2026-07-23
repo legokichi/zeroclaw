@@ -13457,6 +13457,12 @@ pub struct SlackConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// Override for the top-level `ack_reactions` setting. When `None`, the
+    /// channel falls back to `[channels].ack_reactions`. When set
+    /// explicitly, it takes precedence.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub ack_reactions: Option<bool>,
     /// When true (and `mention_only` is also true), messages inside a Slack
     /// thread must also @-mention the bot to trigger a response. By default,
     /// thread replies are allowed through without a mention so the bot can
@@ -25356,6 +25362,24 @@ allowed_users = ["U111"]
         assert!(parsed.mention_only);
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.thread_replies, None);
+    }
+
+    #[test]
+    async fn slack_config_ack_reactions_false_deserializes() {
+        let parsed: SlackConfig = toml::from_str("ack_reactions = false\n").unwrap();
+        assert_eq!(parsed.ack_reactions, Some(false));
+    }
+
+    #[test]
+    async fn slack_config_ack_reactions_true_deserializes() {
+        let parsed: SlackConfig = toml::from_str("ack_reactions = true\n").unwrap();
+        assert_eq!(parsed.ack_reactions, Some(true));
+    }
+
+    #[test]
+    async fn slack_config_ack_reactions_missing_defaults_to_none() {
+        let parsed: SlackConfig = toml::from_str("enabled = true\n").unwrap();
+        assert_eq!(parsed.ack_reactions, None);
     }
 
     #[test]

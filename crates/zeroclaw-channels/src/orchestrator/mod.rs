@@ -4565,6 +4565,13 @@ fn resolve_channel_ack_reactions(
             .get(alias)
             .and_then(|c| c.ack_reactions)
             .unwrap_or(ctx.ack_reactions),
+        "slack" => ctx
+            .prompt_config
+            .channels
+            .slack
+            .get(alias)
+            .and_then(|c| c.ack_reactions)
+            .unwrap_or(ctx.ack_reactions),
         _ => ctx.ack_reactions,
     }
 }
@@ -11685,6 +11692,49 @@ temperature = 0.3
             composite_channel_key("telegram", Some("default")),
             "telegram.default"
         );
+    }
+
+    #[test]
+    fn slack_channel_ack_reactions_override_global_default() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.slack.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::SlackConfig {
+                ack_reactions: Some(false),
+                ..Default::default()
+            },
+        );
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            Arc::new(RecordingChannel::default()),
+            Arc::new(DummyModelProvider),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let msg = channel_message("slack", Some("default"));
+        assert!(!resolve_channel_ack_reactions(&ctx, &msg));
+    }
+
+    #[test]
+    fn slack_channel_ack_reactions_fall_back_to_global_default() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.slack.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::SlackConfig::default(),
+        );
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            Arc::new(RecordingChannel::default()),
+            Arc::new(DummyModelProvider),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let msg = channel_message("slack", Some("default"));
+        assert!(resolve_channel_ack_reactions(&ctx, &msg));
     }
 
     #[test]
