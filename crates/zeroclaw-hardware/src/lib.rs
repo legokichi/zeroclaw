@@ -1,6 +1,5 @@
 #![allow(clippy::to_string_in_format_args)]
 //! Hardware discovery — USB device enumeration and introspection.
-//!
 //! See `docs/hardware-peripherals-design.md` for the full design.
 
 pub mod catalog;
@@ -35,17 +34,7 @@ pub mod pico_flash;
 #[cfg(feature = "hardware")]
 pub mod pico_code;
 
-/// Aardvark USB adapter transport (I2C / SPI / GPIO via aardvark-sys).
-#[cfg(feature = "hardware")]
-pub mod aardvark;
-
-/// Tools backed by the Aardvark transport (i2c_scan, i2c_read, i2c_write,
-/// spi_transfer, gpio_aardvark).
-#[cfg(feature = "hardware")]
-pub mod aardvark_tools;
-
 /// Datasheet management — search, download, and manage device datasheets.
-/// Used by DatasheetTool when an Aardvark is connected.
 #[cfg(feature = "hardware")]
 pub mod datasheet;
 
@@ -66,10 +55,6 @@ pub mod manifest;
 pub mod subprocess;
 pub mod tool_registry;
 
-#[cfg(feature = "hardware")]
-#[allow(unused_imports)]
-pub use aardvark::AardvarkTransport;
-
 use crate::device::DeviceRegistry;
 #[cfg(feature = "hardware")]
 use anyhow::Result;
@@ -83,7 +68,6 @@ pub use zeroclaw_config::schema::{HardwareConfig, HardwareTransport};
 
 /// Merge hardware tools from a [`HardwareBootResult`] into an existing tool
 /// registry, deduplicating by name.
-///
 /// Returns a tuple of `(device_summary, added_tool_names)`.
 pub fn merge_hardware_tools(
     tools: &mut Vec<Box<dyn zeroclaw_api::tool::Tool>>,
@@ -125,16 +109,6 @@ pub struct HardwareBootResult {
     pub context_files_prompt: String,
 }
 
-/// Load hardware context files from `~/.zeroclaw/hardware/` and return them
-/// concatenated as a single markdown string ready for system-prompt injection.
-///
-/// Reads (if they exist):
-/// 1. `~/.zeroclaw/hardware/HARDWARE.md`
-/// 2. `~/.zeroclaw/hardware/devices/<alias>.md` for each discovered alias
-/// 3. All `~/.zeroclaw/hardware/skills/*.md` files (sorted by name)
-///
-/// Missing files are silently skipped. Returns an empty string when no files
-/// are found.
 pub fn load_hardware_context_prompt(aliases: &[&str]) -> String {
     let home = match directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
         Some(h) => h,
@@ -197,13 +171,6 @@ pub fn load_hardware_context_from_dir(hw_dir: &std::path::Path, aliases: &[&str]
     sections.join("\n\n")
 }
 
-/// Inject RPi self-discovery tools and system prompt context into the boot result.
-///
-/// Called from both `boot()` variants when the `peripheral-rpi` feature is active
-/// and the binary is running on Linux. If `/proc/device-tree/model` (or
-/// `/proc/cpuinfo`) identifies a Raspberry Pi, the four built-in GPIO/info
-/// tools are added to `tools` and the board description is appended to
-/// `context_files_prompt` so the LLM knows it is running on the device.
 #[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
 fn inject_rpi_context(
     tools: &mut Vec<Box<dyn zeroclaw_api::tool::Tool>>,
@@ -255,16 +222,6 @@ fn inject_rpi_context(
     }
 }
 
-/// Boot the hardware subsystem: discover devices + load tool registry.
-///
-/// With the `hardware` feature: enumerates USB-serial devices, then
-/// pre-registers any config-specified serial boards not already found by
-/// discovery. [`HardwareSerialTransport`] opens the port lazily per-send,
-/// so this succeeds even when the port doesn't exist at startup.
-///
-/// Without the feature: loads plugin tools from `~/.zeroclaw/tools/` only,
-/// with an empty device registry (GPIO tools will report "no device found"
-/// if called, which is correct).
 #[cfg(feature = "hardware")]
 #[allow(unused_mut)] // tools and context_files_prompt are mutated on Linux+peripheral-rpi
 pub async fn boot(
@@ -340,52 +297,6 @@ pub async fn boot(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "Say \"flash my pico\" to install ZeroClaw firmware automatically"
         );
-    }
-
-    // Aardvark discovery: scan for Total Phase Aardvark USB adapters and
-    // register each one with AardvarkTransport + full I2C/SPI/GPIO capabilities.
-    {
-        use aardvark::AardvarkTransport;
-        use device::DeviceCapabilities;
-
-        let aardvark_ports = aardvark_sys::AardvarkHandle::find_devices();
-        for (i, &port) in aardvark_ports.iter().enumerate() {
-            let alias = registry_inner.register(
-                "aardvark",
-                Some(0x2b76),
-                None,
-                None,
-                Some("Total Phase Aardvark".to_string()),
-            );
-            let transport = std::sync::Arc::new(AardvarkTransport::new(i32::from(port), 100))
-                as std::sync::Arc<dyn transport::Transport>;
-            let caps = DeviceCapabilities {
-                gpio: true,
-                i2c: true,
-                spi: true,
-                ..DeviceCapabilities::default()
-            };
-            registry_inner
-                .attach_transport(&alias, transport, caps)
-                .unwrap_or_else(|e| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"alias": alias, "err": e.to_string()})
-                            ),
-                        "aardvark attach_transport failed"
-                    )
-                });
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"alias": alias, "port_index": i})),
-                "aardvark adapter registered"
-            );
-            println!("[registry] {alias} ready \u{2192} Total Phase port {i}");
-        }
     }
 
     let devices = std::sync::Arc::new(tokio::sync::RwLock::new(registry_inner));

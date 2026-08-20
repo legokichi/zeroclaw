@@ -1,10 +1,4 @@
 //! Transport trait — decouples hardware tools from wire protocol.
-//!
-//! Implementations:
-//! - `serial::HardwareSerialTransport` — lazy-open newline-delimited JSON over USB CDC (Phase 2)
-//! - `SWDTransport` — memory read/write via probe-rs (Phase 7)
-//! - `UF2Transport` — firmware flashing via UF2 mass storage (Phase 6)
-//! - `NativeTransport` — direct Linux GPIO/I2C/SPI via rppal/sysfs (later)
 
 use super::protocol::{ZcCommand, ZcResponse};
 use async_trait::async_trait;
@@ -14,8 +8,12 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum TransportError {
     /// Operation timed out.
-    #[error("transport timeout after {0}s")]
-    Timeout(u64),
+    #[error("transport timeout after {secs}s: {source}")]
+    Timeout {
+        secs: u64,
+        #[source]
+        source: tokio::time::error::Elapsed,
+    },
 
     /// Transport is disconnected or device was removed.
     #[error("transport disconnected")]
@@ -35,7 +33,6 @@ pub enum TransportError {
 }
 
 /// Transport kind discriminator.
-///
 /// Used for capability matching — some tools require a specific transport
 /// (e.g. `pico_flash` requires UF2, `memory_read` prefers SWD).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -48,8 +45,6 @@ pub enum TransportKind {
     Uf2,
     /// Direct Linux GPIO/I2C/SPI (rppal, sysfs).
     Native,
-    /// Total Phase Aardvark USB adapter (I2C/SPI/GPIO via C library).
-    Aardvark,
 }
 
 impl std::fmt::Display for TransportKind {
@@ -59,13 +54,11 @@ impl std::fmt::Display for TransportKind {
             Self::Swd => write!(f, "swd"),
             Self::Uf2 => write!(f, "uf2"),
             Self::Native => write!(f, "native"),
-            Self::Aardvark => write!(f, "aardvark"),
         }
     }
 }
 
 /// Transport trait — sends commands to a hardware device and receives responses.
-///
 /// All implementations MUST use explicit `tokio::time::timeout` on I/O operations.
 /// Callers should never assume success; always handle `TransportError`.
 #[async_trait]
@@ -92,10 +85,16 @@ mod tests {
         assert_eq!(TransportKind::Native.to_string(), "native");
     }
 
-    #[test]
-    fn transport_error_display() {
-        let err = TransportError::Timeout(5);
-        assert_eq!(err.to_string(), "transport timeout after 5s");
+    #[tokio::test]
+    async fn transport_error_display() {
+        let source = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let err = TransportError::Timeout { secs: 5, source };
+        assert_eq!(
+            err.to_string(),
+            "transport timeout after 5s: deadline has elapsed"
+        );
 
         let err = TransportError::Disconnected;
         assert_eq!(err.to_string(), "transport disconnected");

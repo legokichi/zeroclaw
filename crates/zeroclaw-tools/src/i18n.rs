@@ -1,9 +1,4 @@
 //! Fluent helpers for tool-facing strings.
-//!
-//! `zeroclaw-runtime` also reads `tools.ftl`, but this crate cannot depend on
-//! runtime because runtime depends on tool implementations. Keep this helper
-//! local and narrow so tools can route their own schemas and results through
-//! the same catalogue without reversing the crate graph.
 
 use fluent::{FluentArgs, FluentBundle, FluentResource};
 use std::collections::HashMap;
@@ -13,7 +8,13 @@ static TOOL_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static TOOL_FTL_SOURCES: OnceLock<ToolFtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 
-const EN_TOOLS_FTL: &str = include_str!("../../zeroclaw-runtime/locales/en/tools.ftl");
+/// English tool strings, embedded here rather than pulled from
+/// `zeroclaw-runtime` so the dependency direction (runtime -> tools) stays
+/// intact. The file is mirrored from the canonical runtime catalogue by
+/// `cargo generate installers tools-en-ftl`; CI fails on drift. Reading the
+/// runtime copy directly would reach outside this crate, and `cargo package`
+/// copies only the package directory.
+const EN_TOOLS_FTL: &str = include_str!("../locales/en/tools.ftl");
 
 struct ToolFtlSources {
     locale: String,

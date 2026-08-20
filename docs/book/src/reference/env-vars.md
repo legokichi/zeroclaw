@@ -92,6 +92,8 @@ The schema-mirror grammar is the canonical way to inject values, but `ANTHROPIC_
 
 Substitute the alias name in place of `home` to match your config. For multiple aliases on the same family, repeat the line with each alias.
 
+These lines are shell bridges into typed config, not a general rule that constructors read provider-native env vars. Runtime code should receive the resolved value from `Config` unless the integration family explicitly documents a native env bridge.
+
 ## OAuth and CLI-path fields
 
 A handful of fields live as schema fields, reachable via the standard mapping:
@@ -99,6 +101,6 @@ A handful of fields live as schema fields, reachable via the standard mapping:
 1. **MiniMax OAuth refresh flow**: `[providers.models.minimax.<alias>] oauth_refresh_token = "..."` (with optional `oauth_client_id`); region selection is the typed `endpoint` enum (`cn` / `intl`). The runtime exchanges the refresh token for a short-lived access token at provider construction time.
 2. **Qwen OAuth refresh flow**: `[providers.models.qwen.<alias>] oauth_refresh_token = "..."` (with optional `oauth_client_id` and `oauth_resource_url`).
 3. **Gemini OAuth**: `[providers.models.gemini.<alias>] oauth_client_id` and `oauth_client_secret`; optional `oauth_project` pins a Code Assist GCP project ID.
-4. **KiloCLI / Gemini CLI paths**: `[providers.models.kilocli.<alias>] binary_path` and `[providers.models.gemini_cli.<alias>] binary_path`.
+4. **KiloCLI / Gemini CLI / Grok Build CLI process settings**: `[providers.models.kilocli.<alias>] binary_path`, `[providers.models.gemini_cli.<alias>] binary_path`, and `[providers.models.grok_cli.<alias>]` fields `binary_path`, required absolute `working_directory`, optional `extra_args`, and `max_acp_stdout_bytes`. Grok Build aliases may also list environment variable names in `env_passthrough` (tool credentials and the optional `XAI_API_KEY` auth bridge); values are resolved only when the child is spawned and are not stored in config. Authentication uses the CLI login cache by default. The exact name `XAI_API_KEY` is the documented native bridge for API-key auth when explicitly listed; other `XAI_*` and all `GROK_*` names are rejected.
 5. **Transcription / TTS keys**: `[transcription].api_key`, `[providers.tts.openai.<alias>].api_key`, `[providers.tts.elevenlabs.<alias>].api_key`, `[providers.tts.google.<alias>].api_key`.
 6. **Notion / WhatsApp**: `[notion].api_key`, `[channels.whatsapp.<alias>].ws_url` (test/proxy WebSocket override).

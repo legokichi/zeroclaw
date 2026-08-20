@@ -8,30 +8,153 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 
-/// Module-level `pending_approvals` map shared across every
-/// `Arc<WhatsAppChannel>` regardless of who constructs it.
-///
-/// WhatsApp uses webhooks, so `request_approval()` (called by the runtime's
-/// channel pool) and the reply intercept (in the gateway's
-/// `handle_whatsapp_message`) can run on *different* `Arc<WhatsAppChannel>`
-/// instances — the orchestrator constructs one, the gateway constructs
-/// another. An instance-local pending-approvals map would leave one side
-/// registering tokens the other side can never find, silently timing out
-/// every approval request.
-///
-/// Hoisting the map to a process-wide static sidesteps the Arc-sharing
-/// problem entirely: whoever calls `request_approval()` inserts; whoever
-/// receives the webhook reply looks up; both hit the same `HashMap`.
 type PendingApprovalsMap = Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>;
 static PENDING_APPROVALS: LazyLock<Arc<PendingApprovalsMap>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-/// `WhatsApp` channel — uses `WhatsApp` Business Cloud API
+/// Removes a parked approval token when the requesting future goes away.
 ///
-/// This channel operates in webhook mode (push-based) rather than polling.
-/// Messages are received via the gateway's `/whatsapp` webhook endpoint.
-/// The `listen` method here is a no-op placeholder; actual message handling
-/// happens in the gateway when Meta sends webhook events.
+/// `request_approval_attributed` registers a token in [`PENDING_APPROVALS`]
+/// before it does anything else, and the token is a bearer credential for a
+/// tool-call decision: whoever presents it decides that call. An entry left
+/// behind is therefore a decision that stays resolvable for the lifetime of the
+/// process, and the map is process-global, so it is not bounded by a channel
+/// instance either.
+///
+/// Three exits can leave one behind, and none is exotic.
+///
+/// The send is the first thing after registration, so a transient send failure
+/// propagates out with the entry already in the map and nothing later in the
+/// function runs. That one needs no cancellation at all to reach.
+///
+/// The other two are cancellation. Every explicit cleanup lives inside the async
+/// body, so none of it runs if the future is dropped, which a caller-side
+/// timeout or a shutdown both do. `Drop` is the only hook that survives that,
+/// which is why the entry's lifetime is tied to a guard rather than to any code
+/// path.
+///
+/// The guard is disarmed once a decision has been taken through a normal path,
+/// so the existing removals still own their cleanup and nothing is removed
+/// twice. [`remove_pending_and_disarm`] holds the ordering that makes the
+/// disarm safe.
+struct PendingApprovalGuard {
+    token: Option<String>,
+}
+
+impl PendingApprovalGuard {
+    fn new(token: String) -> Self {
+        Self { token: Some(token) }
+    }
+
+    /// The decision was taken through a normal path; stop guarding.
+    fn disarm(&mut self) {
+        self.token = None;
+    }
+}
+
+impl Drop for PendingApprovalGuard {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        // `Drop` is not async, and blocking here would stall whichever runtime
+        // thread is unwinding. Spawn the removal instead. That makes cleanup
+        // asynchronous rather than immediate, and the delay is scheduler
+        // dependent rather than bounded, so the honest guarantee is eventual
+        // removal and not prompt removal. What is not weakened by the delay is
+        // the decision itself: a reply arriving inside that window still finds a
+        // receiver whose sender was dropped with this future, so it cannot be
+        // reported as an accepted decision.
+        zeroclaw_spawn::spawn!(async move {
+            PENDING_APPROVALS.lock().await.remove(&token);
+        });
+    }
+}
+
+/// Removes a parked token and then disarms its guard, in that order.
+///
+/// The ordering is the whole point of the helper. Disarming first leaves a
+/// window: acquiring the map lock is an await, so a request future cancelled
+/// while waiting for it drops a guard that is already unarmed, and the removal
+/// below never runs. The entry survives, which is the exact leak this guard
+/// exists to close. Removing first and disarming afterwards means a
+/// cancellation anywhere inside here still drops an *armed* guard, whose `Drop`
+/// completes the removal.
+///
+/// Both runtime-deny arms call this, and the cancellation regression drives
+/// this same function rather than a copy of it, so the test covers the
+/// production path.
+async fn remove_pending_and_disarm(token: &str, guard: &mut PendingApprovalGuard) {
+    let mut map = PENDING_APPROVALS.lock().await;
+    map.remove(token);
+    guard.disarm();
+}
+
+/// Registers an approval token, waits for the operator, and cleans up after
+/// itself however it leaves.
+///
+/// The send is a parameter so this whole lifecycle can be driven without a live
+/// Meta endpoint. `request_approval_attributed` is a thin wrapper that supplies
+/// the real one, so every ownership transition here happens in the code
+/// production runs rather than in a copy of it: a regression that moved the
+/// guard after the send, dropped it, or changed a cleanup arm would fail.
+///
+/// Registration happens first, then the guard is armed, and only then is
+/// anything sent. That order matters because the send is the first thing that
+/// can leave the function, and it leaves through `?` with the entry already in
+/// the map.
+async fn run_approval_lifecycle<F, Fut>(
+    token: String,
+    approval_timeout_secs: u64,
+    send: F,
+) -> anyhow::Result<zeroclaw_api::channel::AttributedApprovalResponse>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let (tx_approval, rx_approval) = oneshot::channel();
+    {
+        let mut map = PENDING_APPROVALS.lock().await;
+        map.insert(token.clone(), tx_approval);
+    }
+    // Armed immediately after registration rather than later, because the send
+    // below is the first thing that can leave the function.
+    let mut guard = PendingApprovalGuard::new(token.clone());
+
+    // The `?` here is what orphans a live token: it returns with the entry
+    // already registered, and no cleanup below it runs. The guard covers it.
+    send().await?;
+
+    let timeout = std::time::Duration::from_secs(approval_timeout_secs);
+    // Only a real token-echo reply is an operator decision; the dropped-sender
+    // and timeout arms are the runtime denying on its own.
+    let attributed = match tokio::time::timeout(timeout, rx_approval).await {
+        Ok(Ok(response)) => {
+            // The reply arrived, which means the gateway's reply handler has
+            // already removed the entry to take the sender out of the map.
+            // Nothing awaits between here and the disarm, so there is no
+            // cancellation window to cover.
+            guard.disarm();
+            zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+        }
+        Ok(Err(_)) => {
+            remove_pending_and_disarm(&token, &mut guard).await;
+            zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                ChannelApprovalResponse::Deny,
+                zeroclaw_api::channel::ApprovalSource::Unreachable,
+            )
+        }
+        Err(_) => {
+            remove_pending_and_disarm(&token, &mut guard).await;
+            zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                ChannelApprovalResponse::Deny,
+                zeroclaw_api::channel::ApprovalSource::TimedOut,
+            )
+        }
+    };
+    Ok(attributed)
+}
+
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
         anyhow::bail!(
@@ -41,11 +164,6 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-///
-/// # Runtime Negotiation
-///
-/// This Cloud API channel is automatically selected when `phone_number_id` is set in the config.
-/// Use `WhatsAppWebChannel` (with `session_path`) for native Web mode.
 pub struct WhatsAppChannel {
     access_token: String,
     endpoint_id: String,
@@ -169,12 +287,6 @@ impl WhatsAppChannel {
         patterns.iter().any(|re| re.is_match(text))
     }
 
-    /// Apply mention-pattern gating for a message.
-    ///
-    /// Selects the appropriate pattern set based on `is_group`. When the
-    /// pattern set is non-empty, messages that do not match any pattern are
-    /// dropped (`None`); matched messages pass through unchanged. Empty
-    /// pattern sets always admit.
     pub fn apply_mention_gating(
         dm_patterns: &[Regex],
         group_patterns: &[Regex],
@@ -196,7 +308,6 @@ impl WhatsAppChannel {
     }
 
     /// Detect group messages in the WhatsApp Cloud API webhook payload.
-    ///
     /// A message is considered a group message when it carries a `context`
     /// object containing a non-empty `group_id` field.
     fn is_group_message(msg: &serde_json::Value) -> bool {
@@ -276,7 +387,19 @@ impl WhatsAppChannel {
                         continue;
                     }
 
-                    // Extract text content (text and location messages)
+                    // Extract content. Four shapes that produce a usable
+                    // text body:
+                    //   1. text       — plain message; .text.body
+                    //   2. location   — geographic coordinates and optional name
+                    //   3. interactive.button_reply  — user tapped a button
+                    //                                  in an interactive message
+                    //   4. interactive.list_reply    — user picked a row in
+                    //                                  an interactive list
+                    //
+                    // For (2) and (3), surface the option's `id` as
+                    // `[choice]<id>` so consumers can correlate it with the
+                    // original option set; consumers that don't care can
+                    // ignore the prefix.
                     let content = if let Some(text_obj) = msg.get("text") {
                         let Some(body) = text_obj.get("body").and_then(|b| b.as_str()) else {
                             continue;
@@ -305,6 +428,31 @@ impl WhatsAppChannel {
                                 continue;
                             }
                         }
+                    } else if let Some(interactive) = msg.get("interactive") {
+                        let kind = interactive
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
+                        let reply = match kind {
+                            "button_reply" => interactive.get("button_reply"),
+                            "list_reply" => interactive.get("list_reply"),
+                            _ => None,
+                        };
+                        match reply.and_then(|r| r.get("id")).and_then(|i| i.as_str()) {
+                            Some(id) if !id.is_empty() => format!("[choice]{id}"),
+                            _ => {
+                                ::zeroclaw_log::record!(
+                                    DEBUG,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({"from": from})),
+                                    "WhatsApp interactive reply missing id, dropping"
+                                );
+                                continue;
+                            }
+                        }
                     } else {
                         // Could be image, audio, etc. — skip for now
                         ::zeroclaw_log::record!(
@@ -327,25 +475,35 @@ impl WhatsAppChannel {
                     // DMs and group_mention_patterns for groups. When the
                     // applicable pattern set is non-empty, messages without a
                     // match are dropped and matched fragments are stripped.
+                    //
+                    // Bypass for native-interactive replies: a `[choice]<id>`
+                    // body comes from the user tapping a button or list row
+                    // we sent — the bot's own UI counts as an explicit
+                    // interaction with the bot, so the mention requirement
+                    // (intended to gate freeform messages) does not apply.
                     let is_group = Self::is_group_message(msg);
-                    let content = match Self::apply_mention_gating(
-                        &self.dm_mention_patterns,
-                        &self.group_mention_patterns,
-                        &content,
-                        is_group,
-                    ) {
-                        Some(c) => c,
-                        None => {
-                            ::zeroclaw_log::record!(
-                                DEBUG,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_attrs(::serde_json::json!({"from": from})),
-                                "message from did not match mention patterns, dropping"
-                            );
-                            continue;
+                    let content = if content.starts_with("[choice]") {
+                        content
+                    } else {
+                        match Self::apply_mention_gating(
+                            &self.dm_mention_patterns,
+                            &self.group_mention_patterns,
+                            &content,
+                            is_group,
+                        ) {
+                            Some(c) => c,
+                            None => {
+                                ::zeroclaw_log::record!(
+                                    DEBUG,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({"from": from})),
+                                    "WhatsApp message did not match mention patterns, dropping"
+                                );
+                                continue;
+                            }
                         }
                     };
 
@@ -382,6 +540,178 @@ impl WhatsAppChannel {
 
         messages
     }
+
+    /// Send an interactive button message (≤ 3 buttons per Meta's Cloud
+    /// API limit). Each tuple is `(id, label)`; `id` round-trips back
+    /// through the inbound `interactive.button_reply.id` field as a
+    /// `[choice]<id>` synthetic `ChannelMessage` content (see
+    /// `parse_webhook_payload`).
+    ///
+    /// Meta's `interactive` body schema:
+    /// https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages
+    pub async fn send_interactive_buttons(
+        &self,
+        recipient: &str,
+        body_text: &str,
+        buttons: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        if buttons.is_empty() || buttons.len() > 3 {
+            anyhow::bail!(
+                "WhatsApp interactive buttons require 1..=3 options (got {}); \
+                 use send_interactive_list for more",
+                buttons.len()
+            );
+        }
+        let url = format!(
+            "https://graph.facebook.com/v18.0/{}/messages",
+            self.endpoint_id
+        );
+        ensure_https(&url)?;
+        let to = recipient.strip_prefix('+').unwrap_or(recipient);
+        let action_buttons: Vec<serde_json::Value> = buttons
+            .iter()
+            .map(|(id, label)| {
+                // Meta caps button title at 20 chars and id at 256.
+                let title = label.chars().take(20).collect::<String>();
+                let id_trim = id.chars().take(256).collect::<String>();
+                serde_json::json!({
+                    "type": "reply",
+                    "reply": { "id": id_trim, "title": title },
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": { "text": body_text },
+                "action": { "buttons": action_buttons },
+            }
+        });
+        self.post_to_meta(&url, &body).await
+    }
+
+    /// Send an interactive list message (more than 3 options, up to 10
+    /// rows per section, up to 10 sections per Meta's limits). `sections`
+    /// each carry a section title + rows. Each row's `id` round-trips
+    /// through the inbound `interactive.list_reply.id` as `[choice]<id>`.
+    ///
+    /// `button_text` is the button label that opens the list (Meta limits
+    /// to 20 chars).
+    pub async fn send_interactive_list(
+        &self,
+        recipient: &str,
+        body_text: &str,
+        button_text: &str,
+        sections: &[InteractiveListSection],
+    ) -> anyhow::Result<()> {
+        if sections.is_empty() {
+            anyhow::bail!("WhatsApp interactive list requires at least one section");
+        }
+        if sections.len() > 10 {
+            anyhow::bail!(
+                "WhatsApp interactive list capped at 10 sections (got {})",
+                sections.len()
+            );
+        }
+        for s in sections {
+            if s.rows.len() > 10 {
+                anyhow::bail!(
+                    "WhatsApp interactive list section '{}' capped at 10 rows (got {})",
+                    s.title,
+                    s.rows.len()
+                );
+            }
+        }
+        let url = format!(
+            "https://graph.facebook.com/v18.0/{}/messages",
+            self.endpoint_id
+        );
+        ensure_https(&url)?;
+        let to = recipient.strip_prefix('+').unwrap_or(recipient);
+        let action_sections: Vec<serde_json::Value> = sections
+            .iter()
+            .map(|s| {
+                let rows: Vec<serde_json::Value> = s
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        let mut row = serde_json::json!({
+                            "id": r.id.chars().take(200).collect::<String>(),
+                            "title": r.title.chars().take(24).collect::<String>(),
+                        });
+                        if let Some(d) = &r.description {
+                            row["description"] =
+                                serde_json::Value::String(d.chars().take(72).collect());
+                        }
+                        row
+                    })
+                    .collect();
+                serde_json::json!({
+                    "title": s.title.chars().take(24).collect::<String>(),
+                    "rows": rows,
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "list",
+                "body": { "text": body_text },
+                "action": {
+                    "button": button_text.chars().take(20).collect::<String>(),
+                    "sections": action_sections,
+                },
+            }
+        });
+        self.post_to_meta(&url, &body).await
+    }
+
+    async fn post_to_meta(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<()> {
+        let resp = self
+            .http_client()
+            .post(url)
+            .bearer_auth(&self.access_token)
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_body = resp.text().await.unwrap_or_default();
+            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"status": status.to_string(), "error_body": error_body})), "WhatsApp interactive send failed:");
+            anyhow::bail!("WhatsApp API error: {status}");
+        }
+        Ok(())
+    }
+}
+
+/// One section in an interactive list message. Sections group related
+/// rows under a header.
+#[derive(Debug, Clone)]
+pub struct InteractiveListSection {
+    /// Section header (Meta caps at 24 chars; we truncate).
+    pub title: String,
+    /// Rows in this section. Up to 10 per Meta's limit.
+    pub rows: Vec<InteractiveListRow>,
+}
+
+/// One row in an interactive list message.
+#[derive(Debug, Clone)]
+pub struct InteractiveListRow {
+    /// Stable identifier round-tripped via inbound `interactive.list_reply.id`
+    /// as `[choice]<id>`.
+    pub id: String,
+    /// User-visible label (Meta caps at 24 chars).
+    pub title: String,
+    /// Optional secondary line (Meta caps at 72 chars).
+    pub description: Option<String>,
 }
 
 impl WhatsAppChannel {
@@ -519,34 +849,122 @@ impl Channel for WhatsAppChannel {
         Ok(())
     }
 
+    async fn send_choice(
+        &self,
+        recipient: &str,
+        prompt: &str,
+        options: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let trimmed_prompt = prompt.trim();
+        // No options → send the prompt as plain text (or no-op when both
+        // empty); never render a "(reply with name or number)" hint with
+        // nothing under it. Mirrors the trait default's empty guard.
+        if options.is_empty() {
+            if trimmed_prompt.is_empty() {
+                return Ok(());
+            }
+            return self
+                .send(&SendMessage::new(trimmed_prompt, recipient))
+                .await;
+        }
+        // WhatsApp Cloud interactive: ≤ 3 buttons OR up to 10×10 list rows.
+        // 1 option falls through to plain text — there's no UX win to a
+        // single-button interactive message.
+        if options.len() >= 2 && options.len() <= 3 {
+            let buttons: Vec<(String, String)> = options
+                .iter()
+                .map(|(id, label)| (id.clone(), label.clone()))
+                .collect();
+            return self
+                .send_interactive_buttons(recipient, prompt, &buttons)
+                .await;
+        }
+        if options.len() > 3 {
+            // List messages: max 10 rows per section, max 10 sections per
+            // message → up to 100 options. Chunk into sections of ≤10 rows
+            // each so we don't blow past the per-section row cap. Section
+            // titles mark the index range so list UIs render cleanly.
+            const MAX_ROWS_PER_SECTION: usize = 10;
+            const MAX_SECTIONS: usize = 10;
+            let max_total = MAX_ROWS_PER_SECTION * MAX_SECTIONS;
+            if options.len() > max_total {
+                anyhow::bail!(
+                    "WhatsApp send_choice: {} options exceeds list cap ({}); split the prompt or call send_interactive_list directly",
+                    options.len(),
+                    max_total
+                );
+            }
+            let sections: Vec<InteractiveListSection> = options
+                .chunks(MAX_ROWS_PER_SECTION)
+                .enumerate()
+                .map(|(chunk_idx, chunk)| {
+                    let start = chunk_idx * MAX_ROWS_PER_SECTION + 1;
+                    let end = start + chunk.len() - 1;
+                    let title = if options.len() <= MAX_ROWS_PER_SECTION {
+                        "Options".to_string()
+                    } else {
+                        format!("Options {start} to {end}")
+                    };
+                    InteractiveListSection {
+                        title,
+                        rows: chunk
+                            .iter()
+                            .map(|(id, label)| InteractiveListRow {
+                                id: id.clone(),
+                                title: label.clone(),
+                                description: None,
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            return self
+                .send_interactive_list(recipient, prompt, "Choose", &sections)
+                .await;
+        }
+        // Exactly 1 option → defer to plain text. (Empty case handled above.)
+        let mut text = String::new();
+        if !trimmed_prompt.is_empty() {
+            text.push_str(trimmed_prompt);
+            text.push_str("\n\n");
+        }
+        text.push_str("(reply with name or number)\n");
+        for (idx, (_id, label)) in options.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", idx + 1, label.trim()));
+        }
+        let trimmed = text.trim_end().to_string();
+        self.send(&SendMessage::new(trimmed, recipient)).await
+    }
+
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let token = crate::util::new_approval_token();
-        let (tx_approval, rx_approval) = oneshot::channel();
-        {
-            let mut map = PENDING_APPROVALS.lock().await;
-            map.insert(token.clone(), tx_approval);
-        }
-
-        let text = format!(
-            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
-            token, request.tool_name, request.arguments_summary, token, token, token
+        let text = crate::util::build_yesno_approval_prompt(
+            &token,
+            &request.tool_name,
+            &request.arguments_summary,
         );
-        self.send(&SendMessage::new(text, recipient)).await?;
-
-        let timeout = std::time::Duration::from_secs(self.approval_timeout_secs);
-        let response = match tokio::time::timeout(timeout, rx_approval).await {
-            Ok(Ok(response)) => response,
-            _ => {
-                let mut map = PENDING_APPROVALS.lock().await;
-                map.remove(&token);
-                ChannelApprovalResponse::Deny
-            }
-        };
-        Ok(Some(response))
+        let attributed = run_approval_lifecycle(token, self.approval_timeout_secs, || async {
+            self.send(&SendMessage::new(text, recipient)).await
+        })
+        .await?;
+        Ok(Some(attributed))
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -597,6 +1015,16 @@ impl Channel for WhatsAppChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_channel() -> WhatsAppChannel {
+        WhatsAppChannel::new(
+            "test-token".into(),
+            "123456789".into(),
+            "verify-me".into(),
+            "whatsapp_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        )
+    }
 
     #[test]
     fn whatsapp_channel_name() {
@@ -2413,6 +2841,297 @@ mod tests {
         assert_eq!(ch2.approval_timeout_secs, 60);
     }
 
+    /// Generous hang guard rather than a timing assertion. The cleanup these
+    /// tests wait on is a spawned task, so the only honest failure is "it never
+    /// happened", not "it took longer than some scheduling budget".
+    const APPROVAL_CLEANUP_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Park a token the way `request_approval_attributed` does, and hand back
+    /// the guard so a test can decide when the requesting future goes away.
+    async fn park_guarded_token(
+        token: &str,
+    ) -> (
+        PendingApprovalGuard,
+        oneshot::Receiver<ChannelApprovalResponse>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        PENDING_APPROVALS.lock().await.insert(token.to_string(), tx);
+        (PendingApprovalGuard::new(token.to_string()), rx)
+    }
+
+    /// Wait for the guard's spawned removal rather than assuming it has landed.
+    /// `Drop` cannot await, so the removal is a spawned task and a bare assert
+    /// straight after the drop would race it and pass or fail on scheduling.
+    async fn assert_token_cleared(token: &str) {
+        tokio::time::timeout(APPROVAL_CLEANUP_HANG_GUARD, async {
+            while PENDING_APPROVALS.lock().await.contains_key(token) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("token {token} was still registered after its request went away")
+        });
+    }
+
+    /// Block until the lifecycle under test has registered its token, so a
+    /// later assertion cannot pass vacuously against an entry that was never
+    /// there.
+    async fn wait_until_registered(token: &str) {
+        tokio::time::timeout(APPROVAL_CLEANUP_HANG_GUARD, async {
+            while !PENDING_APPROVALS.lock().await.contains_key(token) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("token {token} was never registered"));
+    }
+
+    /// The send is the first thing after registration, so a transient send
+    /// failure returns with the entry already in the map. That path needs no
+    /// cancellation to reach, which is what makes it the cheapest to exploit.
+    ///
+    /// Drives the production lifecycle with a failing send rather than dropping
+    /// a hand-built guard, so moving the guard after the send or removing it
+    /// from the lifecycle would fail this test.
+    #[tokio::test]
+    async fn send_failure_leaves_no_live_token() {
+        let token = "sendfl";
+
+        let result = run_approval_lifecycle(token.to_string(), 300, || async {
+            anyhow::bail!("simulated transport failure")
+        })
+        .await;
+
+        assert!(result.is_err(), "a failing send must propagate");
+        assert_token_cleared(token).await;
+    }
+
+    /// Cancellation is the exit no in-body cleanup can cover, because none of
+    /// that code runs once the future is dropped. The runtime wraps
+    /// `request_approval` in its own timeout, so a caller-side drop of this
+    /// future is an ordinary production event rather than a test-only one.
+    #[tokio::test]
+    async fn cancelled_request_leaves_no_live_token() {
+        let token = "cancel";
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            // A send that succeeds, then a wait long enough that the abort
+            // below lands while the lifecycle is parked on the receiver.
+            run_approval_lifecycle("cancel".to_string(), 300, || async { Ok(()) }).await
+        });
+
+        wait_until_registered(token).await;
+        task.abort();
+        let _ = task.await;
+
+        assert_token_cleared(token).await;
+    }
+
+    /// The narrow window the guard did not originally cover: a cancellation
+    /// that lands while the cleanup is *waiting for the map lock*.
+    ///
+    /// Disarming before acquiring that lock made the window real, because the
+    /// guard would then drop already-unarmed and the removal never ran.
+    ///
+    /// This drives `remove_pending_and_disarm`, which is the function the two
+    /// runtime-deny arms call, and cancels it while it is provably parked on
+    /// the contended lock. Driving the whole lifecycle here instead was tried
+    /// and rejected: there is no way to observe from outside that the spawned
+    /// task has reached the lock rather than an earlier await, so the
+    /// cancellation landed early, the guard dropped still-armed, and the test
+    /// passed against the defect it exists to catch. A racy test that cannot
+    /// fail is worse than a focused one that can.
+    #[tokio::test]
+    async fn cancellation_while_awaiting_the_map_lock_leaves_no_live_token() {
+        let token = "lockct";
+        let (guard, _rx) = park_guarded_token(token).await;
+
+        // Hold the map lock so the helper cannot get past its first await.
+        let held = PENDING_APPROVALS.lock().await;
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            let mut guard = guard;
+            remove_pending_and_disarm("lockct", &mut guard).await;
+        });
+
+        // Let the task reach the contended lock before cancelling it, so the
+        // cancellation lands inside the await rather than before the call.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+
+        // Release, so both the aborted task's guard cleanup and the assertion
+        // below can acquire the map.
+        drop(held);
+
+        assert_token_cleared(token).await;
+    }
+
+    /// The control for the three above. A guard that removed unconditionally
+    /// would pass all of them while breaking the normal path, where the reply
+    /// handler has already taken the sender out of the map and a second removal
+    /// would be removing whatever registered next.
+    #[tokio::test]
+    async fn a_disarmed_guard_removes_nothing() {
+        let token = "disarm";
+        let (mut guard, _rx) = park_guarded_token(token).await;
+        guard.disarm();
+        drop(guard);
+
+        // Give a spawned removal every chance to run before concluding it did not.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            PENDING_APPROVALS.lock().await.contains_key(token),
+            "a disarmed guard must not remove an entry the normal path owns"
+        );
+        PENDING_APPROVALS.lock().await.remove(token);
+    }
+
+    /// A real operator reply must come back attributed to the operator.
+    ///
+    /// No earlier test reached this arm, and none asserted a return value at
+    /// all, so the whole attribution was uncovered on both sides of the
+    /// refactor. It resolves the token exactly as the gateway does, taking the
+    /// sender out of the map before sending, and asserts the decision AND its
+    /// source: the decision alone would pass against a runtime deny that
+    /// happened to carry the same value.
+    #[tokio::test]
+    async fn an_operator_reply_is_attributed_to_the_operator() {
+        let token = "opappr";
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            run_approval_lifecycle("opappr".to_string(), 300, || async { Ok(()) }).await
+        });
+
+        wait_until_registered(token).await;
+
+        let sender = PENDING_APPROVALS
+            .lock()
+            .await
+            .remove(token)
+            .expect("the lifecycle must register before a reply can resolve it");
+        let _ = sender.send(ChannelApprovalResponse::Approve);
+
+        let attributed = task
+            .await
+            .expect("task should not panic")
+            .expect("a resolved approval is not an error");
+
+        assert_eq!(attributed.response, ChannelApprovalResponse::Approve);
+        assert_eq!(
+            attributed.source,
+            zeroclaw_api::channel::ApprovalSource::Operator,
+            "a human answered, so this must not be reported as a runtime fail-closed"
+        );
+        assert!(
+            !PENDING_APPROVALS.lock().await.contains_key(token),
+            "the reply handler removed the entry; the guard must not re-add one"
+        );
+    }
+
+    /// The success arm must DISARM, not merely finish.
+    ///
+    /// A guard still armed after a resolved approval spawns a removal for a
+    /// token the reply handler has already taken. In isolation that is a no-op,
+    /// which is why asserting the entry is absent cannot see the difference. It
+    /// stops being a no-op the moment the token has been reused: the stale
+    /// removal then deletes the NEWER request. That is the same window the
+    /// documented token-reuse residual names, so this reproduces it directly.
+    ///
+    /// The map lock is held across the whole handover deliberately. A stale
+    /// removal is a spawned task that must take that lock, so a version of this
+    /// test that releases it between the resolution and the re-registration
+    /// lets the removal run first, delete nothing, and report success. That
+    /// version was written, and its mutation control caught it passing against
+    /// a deliberately undisarmed guard. Holding the lock orders the removal
+    /// after the re-registration, which is the sequence the residual describes.
+    #[tokio::test]
+    async fn a_resolved_approval_does_not_delete_a_later_registration() {
+        let token = "reuse1";
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            run_approval_lifecycle("reuse1".to_string(), 300, || async { Ok(()) }).await
+        });
+        wait_until_registered(token).await;
+
+        let mut map = PENDING_APPROVALS.lock().await;
+
+        // The reply handler takes the sender out and resolves the request. The
+        // success arm touches no lock, so the lifecycle still completes here.
+        let sender = map.remove(token).expect("registered");
+        let _ = sender.send(ChannelApprovalResponse::Approve);
+        let _ = task.await.expect("task").expect("lifecycle");
+
+        // A later request reuses the same six-character token.
+        let (tx_next, _rx_next) = oneshot::channel();
+        map.insert(token.to_string(), tx_next);
+        drop(map);
+
+        // Give any spawned removal every chance to run before concluding none did.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            PENDING_APPROVALS.lock().await.contains_key(token),
+            "a resolved approval must not delete a later request that reused its token"
+        );
+        PENDING_APPROVALS.lock().await.remove(token);
+    }
+
+    /// A sender dropped without a decision is the runtime failing closed, and
+    /// must be attributed `Unreachable` rather than presented as an operator
+    /// denial.
+    #[tokio::test]
+    async fn a_dropped_sender_is_attributed_unreachable() {
+        let token = "unrch";
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            run_approval_lifecycle("unrch".to_string(), 300, || async { Ok(()) }).await
+        });
+
+        wait_until_registered(token).await;
+        drop(
+            PENDING_APPROVALS
+                .lock()
+                .await
+                .remove(token)
+                .expect("registered"),
+        );
+
+        let attributed = task.await.expect("task").expect("lifecycle");
+
+        assert_eq!(attributed.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            attributed.source,
+            zeroclaw_api::channel::ApprovalSource::Unreachable
+        );
+        assert_token_cleared(token).await;
+    }
+
+    /// An unanswered prompt must be attributed `TimedOut`, which is a different
+    /// fact about the world from `Unreachable` and from an operator denial.
+    #[tokio::test]
+    async fn an_unanswered_prompt_is_attributed_timed_out() {
+        let token = "tmout";
+
+        let attributed = run_approval_lifecycle(token.to_string(), 0, || async { Ok(()) })
+            .await
+            .expect("a timeout is a decision, not an error");
+
+        assert_eq!(attributed.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            attributed.source,
+            zeroclaw_api::channel::ApprovalSource::TimedOut
+        );
+        assert_token_cleared(token).await;
+    }
+
     #[tokio::test]
     async fn pending_approvals_are_shared_across_instances() {
         // Two independent WhatsAppChannel instances — the orchestrator's and
@@ -2452,5 +3171,109 @@ mod tests {
             .lock()
             .await
             .remove("test_share_tok");
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Interactive reply parsing — button_reply / list_reply paths
+    // ══════════════════════════════════════════════════════════
+
+    fn interactive_reply_payload(
+        kind: &str,
+        id: &str,
+        title: &str,
+        from: &str,
+    ) -> serde_json::Value {
+        // WhatsApp Cloud API reply shape for `interactive.button_reply` and
+        // `interactive.list_reply`. Both nest the selected option under the
+        // type-specific key with `id` (callback_id) and `title` (label).
+        serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": from,
+                            "id": "wamid.interactive",
+                            "timestamp": "1700000000",
+                            "type": "interactive",
+                            "interactive": {
+                                "type": kind,
+                                kind: { "id": id, "title": title }
+                            }
+                        }]
+                    }
+                }]
+            }]
+        })
+    }
+
+    #[test]
+    fn whatsapp_parse_interactive_button_reply_emits_choice_sentinel() {
+        let ch = make_channel();
+        let payload =
+            interactive_reply_payload("button_reply", "agent:librarian", "Librarian", "1234567890");
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[choice]agent:librarian");
+        assert_eq!(msgs[0].sender, "+1234567890");
+        assert_eq!(msgs[0].channel, "whatsapp");
+    }
+
+    #[test]
+    fn whatsapp_parse_interactive_list_reply_emits_choice_sentinel() {
+        let ch = make_channel();
+        let payload =
+            interactive_reply_payload("list_reply", "session:backend", "backend", "1234567890");
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[choice]session:backend");
+    }
+
+    #[test]
+    fn whatsapp_parse_interactive_reply_missing_id_dropped() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "1234567890",
+                            "timestamp": "1",
+                            "type": "interactive",
+                            "interactive": {
+                                "type": "button_reply",
+                                "button_reply": { "title": "no id here" }
+                            }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(
+            msgs.is_empty(),
+            "interactive reply without id must be dropped, got: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn whatsapp_interactive_reply_bypasses_dm_mention_gating() {
+        // With dm_mention_patterns set, a freeform body without the trigger
+        // is dropped — but a [choice]<id> body produced by an interactive
+        // reply must be passed through, because the user already explicitly
+        // tapped a button the bot rendered.
+        let ch = WhatsAppChannel::new(
+            "tok".into(),
+            "123".into(),
+            "ver".into(),
+            "whatsapp_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        )
+        .with_dm_mention_patterns(vec!["@?ZeroClaw".into()]);
+        let payload =
+            interactive_reply_payload("button_reply", "agent:librarian", "Librarian", "1234567890");
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1, "[choice] body must bypass mention-gating");
+        assert_eq!(msgs[0].content, "[choice]agent:librarian");
     }
 }

@@ -1,17 +1,4 @@
 //! WebAuthn / FIDO2 hardware key authentication.
-//!
-//! Implements the Web Authentication API server-side flows for registration
-//! (attestation) and authentication (assertion) of hardware security keys
-//! (YubiKey, SoloKey, etc.) and platform authenticators.
-//!
-//! Credentials are serialized as JSON, encrypted via the existing [`SecretStore`],
-//! and persisted to a SQLite-backed credential database. Each user can register
-//! multiple credentials (e.g., primary key + backup key).
-//!
-//! This module intentionally avoids heavy third-party WebAuthn libraries to keep
-//! the dependency footprint small. It implements the essential challenge/response
-//! protocol using `ring` (already present) for signature verification and
-//! `base64`/`serde_json` for serialization.
 
 use crate::security::SecretStore;
 use anyhow::{Context, Result};
@@ -31,6 +18,12 @@ const CHALLENGE_LEN: usize = 32;
 
 /// Credential ID maximum length in bytes.
 const MAX_CREDENTIAL_ID_LEN: usize = 1024;
+
+/// Length of the fixed authenticator data fields through the signature counter.
+const AUTHENTICATOR_DATA_FIXED_LEN: usize = 37;
+
+/// User Present bit in the authenticator data flags byte.
+const AUTHENTICATOR_FLAG_UP: u8 = 0x01;
 
 // ── Public types ────────────────────────────────────────────────
 
@@ -190,7 +183,6 @@ pub struct AuthenticateCredentialResponse {
 // ── WebAuthnManager ─────────────────────────────────────────────
 
 /// Manages WebAuthn registration and authentication flows.
-///
 /// Credentials are encrypted via [`SecretStore`] and persisted to a JSON
 /// file alongside the secret store.
 pub struct WebAuthnManager {
@@ -202,7 +194,6 @@ pub struct WebAuthnManager {
 
 impl WebAuthnManager {
     /// Create a new `WebAuthnManager`.
-    ///
     /// `storage_dir` is the directory where the encrypted credentials file
     /// will be stored (typically `~/.zeroclaw/`).
     pub fn new(config: WebAuthnConfig, secret_store: Arc<SecretStore>, storage_dir: &Path) -> Self {
@@ -215,7 +206,6 @@ impl WebAuthnManager {
     }
 
     /// Begin a WebAuthn registration ceremony.
-    ///
     /// Returns the options to send to the browser and the server-side state
     /// to keep until `finish_registration` is called.
     pub fn start_registration(
@@ -267,7 +257,6 @@ impl WebAuthnManager {
     }
 
     /// Complete a WebAuthn registration ceremony.
-    ///
     /// Validates the client response against the registration state,
     /// extracts the public key, and stores the credential.
     pub fn finish_registration(
@@ -349,7 +338,6 @@ impl WebAuthnManager {
     }
 
     /// Begin a WebAuthn authentication ceremony.
-    ///
     /// Returns the options to send to the browser and the server-side state
     /// to keep until `finish_authentication` is called.
     pub fn start_authentication(
@@ -395,7 +383,6 @@ impl WebAuthnManager {
     }
 
     /// Complete a WebAuthn authentication ceremony.
-    ///
     /// Validates the assertion signature against the stored public key
     /// and updates the sign counter for clone detection.
     pub fn finish_authentication(
@@ -457,6 +444,8 @@ impl WebAuthnManager {
         let auth_data_bytes = URL_SAFE_NO_PAD
             .decode(&response.authenticator_data)
             .context("Invalid base64url in authenticator_data")?;
+        let new_count =
+            validate_assertion_authenticator_data(&auth_data_bytes, &self.config.rp_id)?;
 
         // The signed message is: authenticatorData || SHA-256(clientDataJSON)
         let client_data_hash = ring::digest::digest(&ring::digest::SHA256, &client_data_bytes);
@@ -474,31 +463,23 @@ impl WebAuthnManager {
         verify_es256_signature(&public_key_bytes, &signed_data, &sig_bytes)?;
 
         // 5. Verify and update sign counter (clone detection)
-        if auth_data_bytes.len() >= 37 {
-            let new_count = u32::from_be_bytes([
-                auth_data_bytes[33],
-                auth_data_bytes[34],
-                auth_data_bytes[35],
-                auth_data_bytes[36],
-            ]);
-            if new_count > 0 || credential.sign_count > 0 {
-                anyhow::ensure!(
-                    new_count > credential.sign_count,
-                    "Sign counter did not increase ({new_count} <= {}). Possible cloned authenticator.",
-                    credential.sign_count
-                );
-            }
-
-            // Update the sign counter
-            if let Some(user_creds) = all_credentials.get_mut(&credential.user_id)
-                && let Some(cred) = user_creds
-                    .iter_mut()
-                    .find(|c| c.credential_id == response.id)
-            {
-                cred.sign_count = new_count;
-            }
-            self.save_all_credentials(&all_credentials)?;
+        if new_count > 0 || credential.sign_count > 0 {
+            anyhow::ensure!(
+                new_count > credential.sign_count,
+                "Sign counter did not increase ({new_count} <= {}). Possible cloned authenticator.",
+                credential.sign_count
+            );
         }
+
+        // Update the sign counter
+        if let Some(user_creds) = all_credentials.get_mut(&credential.user_id)
+            && let Some(cred) = user_creds
+                .iter_mut()
+                .find(|c| c.credential_id == response.id)
+        {
+            cred.sign_count = new_count;
+        }
+        self.save_all_credentials(&all_credentials)?;
 
         Ok(())
     }
@@ -604,16 +585,32 @@ impl WebAuthnManager {
     }
 }
 
+fn validate_assertion_authenticator_data(auth_data: &[u8], rp_id: &str) -> Result<u32> {
+    anyhow::ensure!(
+        auth_data.len() >= AUTHENTICATOR_DATA_FIXED_LEN,
+        "Authenticator data is shorter than the required fixed fields"
+    );
+
+    let expected_rp_id_hash = ring::digest::digest(&ring::digest::SHA256, rp_id.as_bytes());
+    anyhow::ensure!(
+        &auth_data[..32] == expected_rp_id_hash.as_ref(),
+        "Authenticator data relying party ID hash mismatch"
+    );
+    anyhow::ensure!(
+        auth_data[32] & AUTHENTICATOR_FLAG_UP != 0,
+        "Authenticator data does not assert user presence"
+    );
+
+    Ok(u32::from_be_bytes([
+        auth_data[33],
+        auth_data[34],
+        auth_data[35],
+        auth_data[36],
+    ]))
+}
+
 // ── Attestation parsing ─────────────────────────────────────────
 
-/// Extract the public key from an attestation object.
-///
-/// For the "none" attestation format used by this implementation, the
-/// attestation object contains a simplified JSON structure with the
-/// public key in uncompressed P-256 format (65 bytes: 0x04 || x || y)
-/// or DER-encoded SubjectPublicKeyInfo.
-///
-/// Returns `(public_key_bytes, sign_count)`.
 fn extract_public_key_from_attestation(attestation_bytes: &[u8]) -> Result<(Vec<u8>, u32)> {
     // Try JSON format first (from our enrollment UI)
     if let Ok(att) = serde_json::from_slice::<AttestationObject>(attestation_bytes) {
@@ -625,7 +622,7 @@ fn extract_public_key_from_attestation(attestation_bytes: &[u8]) -> Result<(Vec<
 
     // Try raw authData format: the authenticator data starts with
     // rpIdHash (32) + flags (1) + signCount (4) + optional attestedCredentialData
-    if attestation_bytes.len() >= 37 {
+    if attestation_bytes.len() >= AUTHENTICATOR_DATA_FIXED_LEN {
         let sign_count = u32::from_be_bytes([
             attestation_bytes[33],
             attestation_bytes[34],
@@ -663,13 +660,6 @@ struct AttestationObject {
     sign_count: Option<u32>,
 }
 
-/// Extract a P-256 uncompressed point from a COSE key map.
-///
-/// Minimal COSE-key parsing for EC2 / P-256 keys. The COSE key is
-/// CBOR-encoded; we look for the x (-2) and y (-3) coordinates.
-///
-/// For simplicity, we accept the raw uncompressed point format
-/// (0x04 || x || y, 65 bytes) directly if the COSE bytes start with 0x04.
 fn extract_p256_from_cose(cose: &[u8]) -> Result<Vec<u8>> {
     // If it starts with 0x04 and is 65 bytes, it's already uncompressed P-256
     if cose.len() >= 65 && cose[0] == 0x04 {
@@ -685,11 +675,6 @@ fn extract_p256_from_cose(cose: &[u8]) -> Result<Vec<u8>> {
 
 // ── Signature verification ──────────────────────────────────────
 
-/// Verify an ES256 (ECDSA P-256 + SHA-256) signature.
-///
-/// `public_key` must be either:
-/// - 65-byte uncompressed P-256 point (0x04 || x || y)
-/// - DER-encoded SubjectPublicKeyInfo
 fn verify_es256_signature(public_key: &[u8], message: &[u8], sig: &[u8]) -> Result<()> {
     // ring's UnparsedPublicKey expects the raw uncompressed point for P-256
     // (not wrapped in SPKI). If we have SPKI, we'd need to extract the point.
@@ -707,18 +692,6 @@ fn verify_es256_signature(public_key: &[u8], message: &[u8], sig: &[u8]) -> Resu
     })
 }
 
-/// Encode a raw P-256 uncompressed point as DER SubjectPublicKeyInfo.
-///
-/// The resulting structure is:
-/// ```asn1
-/// SEQUENCE {
-///   SEQUENCE {
-///     OID 1.2.840.10045.2.1 (ecPublicKey)
-///     OID 1.2.840.10045.3.1.7 (prime256v1 / P-256)
-///   }
-///   BIT STRING <uncompressed point>
-/// }
-/// ```
 #[cfg(test)]
 fn encode_p256_spki(uncompressed_point: &[u8]) -> Vec<u8> {
     // Fixed DER prefix for P-256 SubjectPublicKeyInfo
@@ -754,6 +727,105 @@ mod tests {
     fn test_manager(tmp: &TempDir) -> WebAuthnManager {
         let store = Arc::new(SecretStore::new(tmp.path(), true));
         WebAuthnManager::new(test_config(), store, tmp.path())
+    }
+
+    fn authentication_fixture(
+        tmp: &TempDir,
+    ) -> (
+        WebAuthnManager,
+        ring::signature::EcdsaKeyPair,
+        AuthenticationState,
+        String,
+    ) {
+        let mgr = test_manager(tmp);
+        let (_, reg_state) = mgr.start_registration("user1", "Alice").unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            pkcs8.as_ref(),
+            &rng,
+        )
+        .unwrap();
+        let credential_id = URL_SAFE_NO_PAD.encode(b"full-flow-cred");
+        let client_data = serde_json::json!({
+            "type": "webauthn.create",
+            "challenge": reg_state.challenge,
+            "origin": "http://localhost:42617"
+        });
+        let attestation = serde_json::json!({
+            "public_key": URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref()),
+            "sign_count": 0
+        });
+
+        mgr.finish_registration(
+            &reg_state,
+            &RegisterCredentialResponse {
+                id: credential_id.clone(),
+                attestation_object: URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(&attestation).unwrap()),
+                client_data_json: URL_SAFE_NO_PAD.encode(serde_json::to_vec(&client_data).unwrap()),
+                label: Some("Full Flow Key".into()),
+            },
+        )
+        .unwrap();
+        let (_, auth_state) = mgr.start_authentication("user1").unwrap();
+
+        (mgr, key_pair, auth_state, credential_id)
+    }
+
+    fn authenticator_data(rp_id: &str, flags: u8, sign_count: u32) -> Vec<u8> {
+        let rp_id_hash = ring::digest::digest(&ring::digest::SHA256, rp_id.as_bytes());
+        let mut auth_data = Vec::with_capacity(AUTHENTICATOR_DATA_FIXED_LEN);
+        auth_data.extend_from_slice(rp_id_hash.as_ref());
+        auth_data.push(flags);
+        auth_data.extend_from_slice(&sign_count.to_be_bytes());
+        auth_data
+    }
+
+    fn signed_authentication_response(
+        key_pair: &ring::signature::EcdsaKeyPair,
+        state: &AuthenticationState,
+        credential_id: &str,
+        auth_data: &[u8],
+    ) -> AuthenticateCredentialResponse {
+        let client_data = serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": state.challenge,
+            "origin": "http://localhost:42617"
+        });
+        let client_data_bytes = serde_json::to_vec(&client_data).unwrap();
+        let client_data_hash = ring::digest::digest(&ring::digest::SHA256, &client_data_bytes);
+        let mut signed_data = auth_data.to_vec();
+        signed_data.extend_from_slice(client_data_hash.as_ref());
+        let signature = key_pair
+            .sign(&ring::rand::SystemRandom::new(), &signed_data)
+            .unwrap();
+
+        AuthenticateCredentialResponse {
+            id: credential_id.to_owned(),
+            authenticator_data: URL_SAFE_NO_PAD.encode(auth_data),
+            client_data_json: URL_SAFE_NO_PAD.encode(&client_data_bytes),
+            signature: URL_SAFE_NO_PAD.encode(signature.as_ref()),
+        }
+    }
+
+    fn assert_authentication_rejected_without_counter_change(
+        mgr: &WebAuthnManager,
+        state: &AuthenticationState,
+        response: &AuthenticateCredentialResponse,
+        expected_error: &str,
+    ) {
+        let error = mgr.finish_authentication(state, response).unwrap_err();
+        assert!(
+            error.to_string().contains(expected_error),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(mgr.list_credentials("user1").unwrap()[0].sign_count, 0);
     }
 
     #[test]
@@ -1131,79 +1203,10 @@ mod tests {
     #[test]
     fn full_authentication_flow_with_real_keys() {
         let tmp = TempDir::new().unwrap();
-        let mgr = test_manager(&tmp);
-
-        // 1. Register
-        let (_, reg_state) = mgr.start_registration("user1", "Alice").unwrap();
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
-            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-            &rng,
-        )
-        .unwrap();
-        let key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
-            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-            pkcs8.as_ref(),
-            &rng,
-        )
-        .unwrap();
-
-        let reg_client_data = serde_json::json!({
-            "type": "webauthn.create",
-            "challenge": reg_state.challenge,
-            "origin": "http://localhost:42617"
-        });
-
-        let cred_id = URL_SAFE_NO_PAD.encode(b"full-flow-cred");
-        let attestation = serde_json::json!({
-            "public_key": URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref()),
-            "sign_count": 0
-        });
-
-        mgr.finish_registration(
-            &reg_state,
-            &RegisterCredentialResponse {
-                id: cred_id.clone(),
-                attestation_object: URL_SAFE_NO_PAD
-                    .encode(serde_json::to_vec(&attestation).unwrap()),
-                client_data_json: URL_SAFE_NO_PAD
-                    .encode(serde_json::to_vec(&reg_client_data).unwrap()),
-                label: Some("Full Flow Key".into()),
-            },
-        )
-        .unwrap();
-
-        // 2. Authenticate
-        let (_, auth_state) = mgr.start_authentication("user1").unwrap();
-
-        let auth_client_data = serde_json::json!({
-            "type": "webauthn.get",
-            "challenge": auth_state.challenge,
-            "origin": "http://localhost:42617"
-        });
-        let auth_client_data_bytes = serde_json::to_vec(&auth_client_data).unwrap();
-
-        // Build authenticator data:
-        // rpIdHash (32) + flags (1, 0x01 = UP) + signCount (4, = 1)
-        let rp_id_hash = ring::digest::digest(&ring::digest::SHA256, b"localhost");
-        let mut auth_data = Vec::with_capacity(37);
-        auth_data.extend_from_slice(rp_id_hash.as_ref()); // 32 bytes
-        auth_data.push(0x01); // flags: UP
-        auth_data.extend_from_slice(&1u32.to_be_bytes()); // sign count = 1
-
-        // Sign: authenticatorData || SHA-256(clientDataJSON)
-        let client_data_hash = ring::digest::digest(&ring::digest::SHA256, &auth_client_data_bytes);
-        let mut signed_data = auth_data.clone();
-        signed_data.extend_from_slice(client_data_hash.as_ref());
-
-        let sig = key_pair.sign(&rng, &signed_data).unwrap();
-
-        let auth_response = AuthenticateCredentialResponse {
-            id: cred_id,
-            authenticator_data: URL_SAFE_NO_PAD.encode(&auth_data),
-            client_data_json: URL_SAFE_NO_PAD.encode(&auth_client_data_bytes),
-            signature: URL_SAFE_NO_PAD.encode(sig.as_ref()),
-        };
+        let (mgr, key_pair, auth_state, credential_id) = authentication_fixture(&tmp);
+        let auth_data = authenticator_data("localhost", AUTHENTICATOR_FLAG_UP, 1);
+        let auth_response =
+            signed_authentication_response(&key_pair, &auth_state, &credential_id, &auth_data);
 
         mgr.finish_authentication(&auth_state, &auth_response)
             .unwrap();
@@ -1211,6 +1214,54 @@ mod tests {
         // Verify sign count was updated
         let creds = mgr.list_credentials("user1").unwrap();
         assert_eq!(creds[0].sign_count, 1);
+    }
+
+    #[test]
+    fn authentication_rejects_short_authenticator_data() {
+        let tmp = TempDir::new().unwrap();
+        let (mgr, key_pair, auth_state, credential_id) = authentication_fixture(&tmp);
+        let auth_data = vec![0; AUTHENTICATOR_DATA_FIXED_LEN - 1];
+        let response =
+            signed_authentication_response(&key_pair, &auth_state, &credential_id, &auth_data);
+
+        assert_authentication_rejected_without_counter_change(
+            &mgr,
+            &auth_state,
+            &response,
+            "shorter than the required fixed fields",
+        );
+    }
+
+    #[test]
+    fn authentication_rejects_wrong_relying_party_hash() {
+        let tmp = TempDir::new().unwrap();
+        let (mgr, key_pair, auth_state, credential_id) = authentication_fixture(&tmp);
+        let auth_data = authenticator_data("other.example", AUTHENTICATOR_FLAG_UP, 1);
+        let response =
+            signed_authentication_response(&key_pair, &auth_state, &credential_id, &auth_data);
+
+        assert_authentication_rejected_without_counter_change(
+            &mgr,
+            &auth_state,
+            &response,
+            "relying party ID hash mismatch",
+        );
+    }
+
+    #[test]
+    fn authentication_rejects_missing_user_presence() {
+        let tmp = TempDir::new().unwrap();
+        let (mgr, key_pair, auth_state, credential_id) = authentication_fixture(&tmp);
+        let auth_data = authenticator_data("localhost", 0, 1);
+        let response =
+            signed_authentication_response(&key_pair, &auth_state, &credential_id, &auth_data);
+
+        assert_authentication_rejected_without_counter_change(
+            &mgr,
+            &auth_state,
+            &response,
+            "does not assert user presence",
+        );
     }
 
     #[test]

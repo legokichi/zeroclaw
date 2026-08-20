@@ -10,11 +10,6 @@ use zeroclaw_api::tool::ToolResult;
 
 use super::traits::{HookHandler, HookResult};
 
-/// Dispatcher that manages registered hook handlers.
-///
-/// Void hooks are dispatched in parallel via `join_all`.
-/// Modifying hooks run sequentially by priority (higher first), piping output
-/// and short-circuiting on `Cancel`.
 pub struct HookRunner {
     handlers: Vec<Box<dyn HookHandler>>,
 }
@@ -31,6 +26,10 @@ impl HookRunner {
         Self {
             handlers: Vec::new(),
         }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.handlers.is_empty()
     }
 
     pub fn from_config(hooks: &zeroclaw_config::schema::HooksConfig) -> Self {
@@ -204,11 +203,16 @@ impl HookRunner {
     ) -> HookResult<()> {
         for h in &self.handlers {
             let hook_name = h.name();
-            match AssertUnwindSafe(h.before_llm_call(messages, model))
+            let mut candidate_messages = messages.clone();
+            let mut candidate_model = model.clone();
+            match AssertUnwindSafe(h.before_llm_call(&mut candidate_messages, &mut candidate_model))
                 .catch_unwind()
                 .await
             {
-                Ok(HookResult::Continue(())) => {}
+                Ok(HookResult::Continue(())) => {
+                    *messages = candidate_messages;
+                    *model = candidate_model;
+                }
                 Ok(HookResult::Cancel(reason)) => {
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_llm_call cancelled by hook");
                     return HookResult::Cancel(reason);
@@ -496,22 +500,6 @@ mod tests {
         }
     }
 
-    // ── Panic recovery + cancellation propagation (#7688) ────────────────────
-    //
-    // Pinned regression: a hook that panics must not abort the runner or
-    // prevent subsequent handlers in the same `run_*` call from running, and
-    // a hook that returns `HookResult::Cancel(_)` must short-circuit the
-    // remaining handlers in the same call. These contracts are spelled out
-    // at lines 144–156 (cancel) and 148–156 (panic recovery) for
-    // `run_before_model_resolve`, and duplicated in every other `run_*`
-    // method on `HookRunner`. Without focused tests, a future refactor that
-    // drops the catch_unwind arm as "seems redundant because hook code
-    // shouldn't panic" would silently regress runtime control flow.
-    //
-    // We deliberately cover a small representative set of hook families
-    // rather than all six, matching the issue acceptance criteria ("tests
-    // document any intentional asymmetry between hook families").
-
     /// A hook that panics on a configurable method. Records nothing; its
     /// only role is to exercise the `catch_unwind` branch in the runner.
     struct PanickingHook {
@@ -604,12 +592,6 @@ mod tests {
             priority: 0,
         }));
 
-        // `before_model_resolve` returns the (provider, model) tuple; the
-        // panicker yields no value so the runner falls back to the prior
-        // (input) values and the subsequent UppercasePromptHook ... wait,
-        // UppercasePromptHook only overrides before_prompt_build. Use a
-        // hook that does override before_model_resolve so the "subsequent
-        // handler ran" assertion is meaningful.
         struct ModelConstHook {
             name: String,
             priority: i32,
@@ -757,6 +739,42 @@ mod tests {
             0,
             "hooks after the canceller must NOT run"
         );
+    }
+
+    #[tokio::test]
+    async fn panicking_before_llm_call_discards_partial_mutations() {
+        struct MutateThenPanicHook;
+
+        #[async_trait]
+        impl HookHandler for MutateThenPanicHook {
+            fn name(&self) -> &str {
+                "mutate-then-panic"
+            }
+
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> HookResult<()> {
+                messages[0].content = "partial mutation".into();
+                *model = "partial-model".into();
+                panic!("hook panic after mutation");
+            }
+        }
+
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(MutateThenPanicHook));
+        let mut messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "original request".into(),
+        }];
+        let mut model = "original-model".into();
+
+        let result = runner.run_before_llm_call(&mut messages, &mut model).await;
+
+        assert!(matches!(result, HookResult::Continue(())));
+        assert_eq!(messages[0].content, "original request");
+        assert_eq!(model, "original-model");
     }
 
     #[tokio::test]

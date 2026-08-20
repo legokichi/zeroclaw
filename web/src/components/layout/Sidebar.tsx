@@ -1,7 +1,11 @@
-import { NavLink } from 'react-router-dom';
+import { useLocation } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
+import { findActiveNavPath } from './sidebarNav';
+import { railAsideStyle, railLinkClassName, railNavClassName } from './sidebarRail';
+import { SidebarNavLink } from './SidebarNavLink';
 import {
   Activity,
+  ArrowDownToLine,
   Bot,
   Clock,
   LayoutDashboard,
@@ -18,8 +22,12 @@ import {
   Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { getStatus } from '@/lib/api';
+import { useVersionCheck } from '@/hooks/useVersionCheck';
+import { UpgradeDialog } from '@/components/UpgradeDialog';
+import type { StatusResponse } from '@/types/api';
 
 interface NavItem {
   to: string;
@@ -71,6 +79,10 @@ const navGroups: NavGroup[] = [
   },
 ];
 
+// NavLink matches path prefixes by default. Resolve the longest registered
+// destination so a specific item can suppress its otherwise-active ancestors.
+const navPaths = navGroups.flatMap((group) => group.items.map((item) => item.to));
+
 // The 6 Quickstart sections (Workspace, Providers, Channels, Memory,
 // Hardware, Tunnel) live under /config now — they're the first group
 // inside the Config explorer's sidebar. The /setup/<section> deep-link
@@ -79,62 +91,147 @@ const navGroups: NavGroup[] = [
 
 // ── Desktop rail item ───────────────────────────────────────────────────────
 // Icon-only nav item for the slim rail. The icon is the affordance; the label
-// is exposed three ways: title (native tooltip), aria-label (screen readers),
-// and a token-styled popover to the right shown on hover OR keyboard focus.
-// Active state = accent icon + a 2px left accent bar + subtle accent tint, with
-// aria-current="page" so assistive tech announces the current section.
-function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) {
+// is exposed three ways: title (native tooltip, used as a screen-reader /
+// no-JS fallback), aria-label (screen readers), and a token-styled popover to
+// the right shown on hover OR keyboard focus.
+//
+// The popover is rendered into `document.body` via `createPortal` so it
+// lives outside the desktop `<nav>`'s DOM subtree (the `<nav>` is a scroll
+// container with `overflow-y: auto`; rendering the popover inside the
+// subtree would make it a positioned descendant of that scroll container,
+// which we don't want). With the portal, the popover is rendered into
+// the top-level body and `position: fixed` pins it to viewport coords
+// computed from the NavLink's bounding rect, with `scroll` / `resize`
+// listeners re-anchoring it while it is visible. Because the popover was
+// the only content that ever extended past the rail's right border, the
+// nav needs no horizontal overflow handling at all: `overflow-y: auto`
+// alone leaves `scrollWidth === clientWidth`, so no `overflow-x` value
+// (hidden or clip) is applied to either the `<nav>` or the `<aside>`.
+function RailNavItem({
+  item,
+  activePath,
+  onClick,
+}: {
+  item: NavItem;
+  activePath: string | null;
+  onClick: () => void;
+}) {
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
-  return (
-    <NavLink
-      to={to}
-      end={to === '/'}
-      onClick={onClick}
-      title={text}
-      aria-label={text}
-      className={({ isActive }) =>
-        [
-          'group relative flex h-10 w-10 mx-auto items-center justify-center',
-          'rounded-[var(--radius-md)] transition-colors duration-150',
-          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
-          isActive
-            ? 'bg-pc-accent/10 text-pc-accent'
-            : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
-        ].join(' ')
+  const linkRef = useRef<HTMLAnchorElement>(null);
+  // Tooltip anchor in viewport coords, derived from the DOM: `tooltipTop`
+  // is the vertical center of the NavLink (so the popover visually aligns
+  // with the icon) and `tooltipLeft` is the rail's right edge (the closest
+  // `<aside>`) plus the 8 px visual gap —
+  // i.e. the popover sits flush against the rail. Both are `null` together
+  // when the popover should not render. Deriving both from the rect means
+  // the rail's `w-14` width is no longer hard-coded into the popover's
+  // horizontal position.
+  // Hover and keyboard focus are tracked independently so a mouseleave does
+  // not hide a tooltip that should remain visible while the link is still
+  // `document.activeElement` (the "hover or keyboard focus" visibility
+  // contract). `tooltipVisible` is their union; the position state is only
+  // meaningful while it is true.
+  const [hovered, setHovered] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const tooltipVisible = hovered || focused;
+  const [tooltipTop, setTooltipTop] = useState<number | null>(null);
+  const [tooltipLeft, setTooltipLeft] = useState<number | null>(null);
+
+  // Re-anchor the popover while it is visible so it tracks the NavLink across
+  // viewport scrolls and resize events, and compute the initial position when
+  // visibility flips to true (hover or focus). Cleanup on unmount / hide.
+  useEffect(() => {
+    if (!tooltipVisible) return;
+    const update = () => {
+      const linkRect = linkRef.current?.getBoundingClientRect();
+      // Anchor the popover to the rail's right edge (the closest `<aside>`),
+      // not the link's right edge. The rail is `w-14` (56 px) and the desired
+      // gap is 8 px; deriving from the rail's actual rect keeps the visual gap
+      // stable regardless of how the link is positioned within the rail
+      // (centered icon, full-width item, future layout changes, etc.) — i.e.
+      // the rail's `w-14` is no longer duplicated into the popover's
+      // horizontal position.
+      const railRect = linkRef.current
+        ?.closest('aside')
+        ?.getBoundingClientRect();
+      if (linkRect && railRect) {
+        setTooltipTop(linkRect.top + linkRect.height / 2);
+        setTooltipLeft(railRect.right + 8); // 8 px gap from the rail's right edge
       }
-    >
-      {({ isActive }) => (
-        <>
-          {/* 2px left accent bar marking the active item against the rail edge. */}
-          {isActive && (
-            <span
-              aria-hidden="true"
-              className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
+    };
+    update();
+    window.addEventListener('scroll', update, true);
+    window.addEventListener('resize', update);
+    return () => {
+      window.removeEventListener('scroll', update, true);
+      window.removeEventListener('resize', update);
+    };
+  }, [tooltipVisible]);
+
+  return (
+    <>
+      <SidebarNavLink
+        to={to}
+        activePath={activePath}
+        ref={linkRef}
+        onClick={onClick}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        title={text}
+        aria-label={text}
+        className={({ isActive }) =>
+          [
+            railLinkClassName,
+            'rounded-[var(--radius-md)] transition-colors duration-150',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
+            isActive
+              ? 'bg-pc-accent/10 text-pc-accent'
+              : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
+          ].join(' ')
+        }
+      >
+        {({ isActive }) => (
+          <>
+            {/* 2px left accent bar marking the active item against the rail edge. */}
+            {isActive && (
+              <span
+                aria-hidden="true"
+                className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
+              />
+            )}
+            <Icon
+              className={`h-[22px] w-[22px] shrink-0 transition-colors ${
+                isActive
+                  ? 'text-pc-accent'
+                  : 'group-hover:text-pc-text-secondary'
+              }`}
             />
-          )}
-          <Icon
-            className={`h-[22px] w-[22px] shrink-0 transition-colors ${
-              isActive ? 'text-pc-accent' : 'group-hover:text-pc-text-secondary'
-            }`}
-          />
-          {/* Tooltip popover to the right — appears on pointer hover and on
-              keyboard focus (focus-within) so the rail is usable without a
-              mouse. Token-styled; non-interactive so it never traps focus. */}
+          </>
+        )}
+      </SidebarNavLink>
+      {tooltipVisible &&
+        tooltipTop !== null &&
+        createPortal(
           <span
             role="tooltip"
-            className="pointer-events-none absolute left-full ml-2 z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+            className="pointer-events-none fixed z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs"
             style={{
+              top: tooltipTop,
+              left: tooltipLeft ?? 0, // set alongside tooltipTop in the `update` closure
+              transform: 'translateY(-50%)',
               background: 'var(--pc-bg-elevated)',
               color: 'var(--pc-text-primary)',
               border: '1px solid var(--pc-border)',
             }}
           >
             {text}
-          </span>
-        </>
-      )}
-    </NavLink>
+          </span>,
+          document.body,
+        )}
+    </>
   );
 }
 
@@ -142,13 +239,21 @@ function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) 
 // Full labelled row (icon + text) for the mobile drawer, with the same calm
 // active treatment as before: subtle accent tint, 2px left accent bar, accent
 // icon, and aria-current via NavLink.
-function DrawerNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) {
+function DrawerNavItem({
+  item,
+  activePath,
+  onClick,
+}: {
+  item: NavItem;
+  activePath: string | null;
+  onClick: () => void;
+}) {
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
   return (
-    <NavLink
+    <SidebarNavLink
       to={to}
-      end={to === '/'}
+      activePath={activePath}
       onClick={onClick}
       className={({ isActive }) =>
         [
@@ -176,16 +281,17 @@ function DrawerNavItem({ item, onClick }: { item: NavItem; onClick: () => void }
           <span className="whitespace-nowrap">{text}</span>
         </>
       )}
-    </NavLink>
+    </SidebarNavLink>
   );
 }
 
 // ── Mobile drawer group ─────────────────────────────────────────────────────
 // One labelled cluster: a faint uppercase heading associated with its <ul> via
 // aria-labelledby so screen readers announce the group name.
-function DrawerGroup({ group, index, onClick }: {
+function DrawerGroup({ group, index, activePath, onClick }: {
   group: NavGroup;
   index: number;
+  activePath: string | null;
   onClick: () => void;
 }) {
   const heading = t(group.headingKey);
@@ -200,7 +306,12 @@ function DrawerGroup({ group, index, onClick }: {
         {heading}
       </h2>
       {group.items.map((item) => (
-        <DrawerNavItem key={item.to} item={item} onClick={onClick} />
+        <DrawerNavItem
+          key={item.to}
+          item={item}
+          activePath={activePath}
+          onClick={onClick}
+        />
       ))}
     </div>
   );
@@ -212,6 +323,22 @@ interface SidebarProps {
 }
 
 export default function Sidebar({ open, onClose }: SidebarProps) {
+  const { pathname } = useLocation();
+  const activePath = findActiveNavPath(pathname, navPaths);
+  const [status, setStatus] = useState<StatusResponse | null>(null);
+  useEffect(() => {
+    getStatus()
+      .then(setStatus)
+      .catch(() => { /* silently ignore */ });
+  }, []);
+  // `check_updates` is undefined on older gateways → treat as enabled.
+  const checkUpdates = status?.check_updates !== false;
+  const { info, loading, refetch } = useVersionCheck(checkUpdates);
+  const hasUpdate = info?.is_newer === true;
+  const version = status?.version ?? null;
+  const [upgradeOpen, setUpgradeOpen] = useState(false);
+  const openUpgrade = () => setUpgradeOpen(true);
+
   return (
     <>
       {/* Backdrop — mobile only */}
@@ -231,11 +358,11 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           divider rules between the icon clusters. */}
       <aside
         className="hidden md:flex fixed top-0 left-0 h-screen w-14 flex-col border-r z-50"
-        style={{ background: 'var(--pc-bg-sidebar)', borderColor: 'var(--pc-border)' }}
+        style={railAsideStyle}
         aria-label={t('nav.aria.primary')}
       >
         <RailLogo />
-        <nav className="flex-1 overflow-y-auto py-3 px-1.5" aria-label={t('nav.aria.primary')}>
+        <nav className={railNavClassName} aria-label={t('nav.aria.primary')}>
           {navGroups.map((group, index) => (
             <div key={group.headingKey} className="space-y-1" role="group" aria-label={t(group.headingKey)}>
               {/* Thin divider between clusters (skipped before the first). */}
@@ -247,12 +374,17 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
                 />
               )}
               {group.items.map((item) => (
-                <RailNavItem key={item.to} item={item} onClick={onClose} />
+                <RailNavItem
+                  key={item.to}
+                  item={item}
+                  activePath={activePath}
+                  onClick={onClose}
+                />
               ))}
             </div>
           ))}
         </nav>
-        <RailFooter />
+        <RailFooter version={version} hasUpdate={hasUpdate} onOpen={openUpgrade} />
       </aside>
 
       {/* Mobile drawer — labelled full version (icons + labels), slides in/out. */}
@@ -267,11 +399,29 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
         <DrawerLogo />
         <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5" aria-label={t('nav.aria.primary')}>
           {navGroups.map((group, index) => (
-            <DrawerGroup key={group.headingKey} group={group} index={index} onClick={onClose} />
+            <DrawerGroup
+              key={group.headingKey}
+              group={group}
+              index={index}
+              activePath={activePath}
+              onClick={onClose}
+            />
           ))}
         </nav>
-        <DrawerFooter />
+        <DrawerFooter version={version} hasUpdate={hasUpdate} onOpen={openUpgrade} />
       </aside>
+
+      <UpgradeDialog
+        open={upgradeOpen}
+        info={info}
+        loading={loading}
+        checkUpdatesEnabled={checkUpdates}
+        allowSelfUpgrade={status?.allow_self_upgrade === true}
+        restartMode={status?.restart_mode}
+        restartHint={status?.restart_hint}
+        onRefetch={refetch}
+        onClose={() => setUpgradeOpen(false)}
+      />
     </>
   );
 }
@@ -336,44 +486,110 @@ function DrawerLogo() {
 
 // ── Footers ─────────────────────────────────────────────────────────────────
 
-function useVersion() {
-  const [version, setVersion] = useState<string | null>(null);
-  useEffect(() => {
-    getStatus()
-      .then((s) => { if (s.version) setVersion(s.version); })
-      .catch(() => { /* silently ignore */ });
-  }, []);
-  return version;
+interface FooterProps {
+  version: string | null;
+  /** A newer release is available — render an accent dot. */
+  hasUpdate: boolean;
+  /** Open the upgrade dialog. */
+  onOpen: () => void;
 }
 
-// Rail footer — version tag only, centered, with a native tooltip carrying the
-// full "ZeroClaw Gateway vX" string since the rail has no room for the label.
-function RailFooter() {
-  const version = useVersion();
+// Rail footer — version tag as a button, centered, with a native tooltip
+// carrying the full "ZeroClaw Gateway vX" string since the rail has no room for
+// the label. When an update is available the version row is replaced by a
+// pulsing download-arrow icon stacked above the version text — the dot was
+// too easy to miss against the muted `text-faint` colour.
+function RailFooter({ version, hasUpdate, onOpen }: FooterProps) {
+  const title = hasUpdate
+    ? t('sidebar.update_available')
+    : version
+      ? `${t('sidebar.gateway')} v${version}`
+      : t('sidebar.gateway');
   return (
     <div
       className="border-t shrink-0 flex items-center justify-center"
       style={{ borderColor: 'var(--pc-border)', padding: '10px 0' }}
-      title={version ? `${t('sidebar.gateway')} v${version}` : t('sidebar.gateway')}
     >
-      {version && (
-        <span style={{ fontSize: '9px', color: 'var(--pc-text-faint)' }}>
-          v{version}
-        </span>
+      {(version || hasUpdate) && (
+        <button
+          type="button"
+          onClick={onOpen}
+          title={title}
+          aria-label={title}
+          className={[
+            'relative flex flex-col items-center justify-center gap-0.5 rounded px-1.5 py-1 cursor-pointer transition-colors',
+            hasUpdate
+              ? 'bg-pc-accent/10 hover:bg-pc-accent/20'
+              : 'hover:bg-pc-surface',
+          ].join(' ')}
+        >
+          {hasUpdate && (
+            <ArrowDownToLine
+              aria-hidden="true"
+              className="h-3.5 w-3.5 animate-bounce-soft"
+              style={{ color: 'var(--pc-accent)' }}
+            />
+          )}
+          {/* Red badge dot — an unmistakable attention-grabber layered atop the
+              pulsing arrow so an available update is never missed at a glance. */}
+          {hasUpdate && (
+            <span
+              aria-hidden="true"
+              className="absolute rounded-full"
+              style={{
+                top: '2px',
+                right: '2px',
+                width: '7px',
+                height: '7px',
+                backgroundColor: 'var(--color-status-error)',
+                boxShadow: '0 0 0 1.5px var(--pc-bg-surface)',
+              }}
+            />
+          )}
+          <span
+            style={{
+              fontSize: '9px',
+              color: hasUpdate ? 'var(--pc-accent)' : 'var(--pc-text-faint)',
+              fontWeight: hasUpdate ? 600 : undefined,
+            }}
+          >
+            {version ? `v${version}` : t('upgrade.title')}
+          </span>
+        </button>
       )}
     </div>
   );
 }
 
-// Drawer footer — full labelled gateway line for mobile.
-function DrawerFooter() {
-  const version = useVersion();
+// Drawer footer — full labelled gateway line for mobile, clickable to upgrade.
+// When an update is available the dot is replaced by a soft-bouncing download
+// arrow rendered at body-text size so the affordance is unmistakable.
+function DrawerFooter({ version, hasUpdate, onOpen }: FooterProps) {
   return (
     <div
       className="px-5 py-4 border-t text-[10px] uppercase tracking-wider"
       style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
     >
-      {t('sidebar.gateway')}
+      <button
+        type="button"
+        onClick={onOpen}
+        title={hasUpdate ? t('sidebar.update_available') : undefined}
+        className={[
+          'flex items-center gap-1.5 cursor-pointer transition-opacity uppercase tracking-wider',
+          hasUpdate ? 'opacity-100' : 'hover:opacity-80',
+        ].join(' ')}
+        style={hasUpdate ? { color: 'var(--pc-accent)' } : undefined}
+      >
+        {hasUpdate && (
+          <ArrowDownToLine
+            aria-hidden="true"
+            className="h-3.5 w-3.5 animate-bounce-soft"
+          />
+        )}
+        <span>
+          {hasUpdate ? t('sidebar.update_available') : t('sidebar.gateway')}
+        </span>
+      </button>
       {version && (
         <div className="mt-0.5 normal-case tracking-normal" style={{ fontSize: '9px' }}>
           v{version}

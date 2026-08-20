@@ -1,24 +1,4 @@
 //! ToolRegistry — central store of all available tools.
-//!
-//! The LLM receives its tool list exclusively from the registry.
-//! If a tool is not registered, the LLM cannot call it.
-//!
-//! Startup sequence (called via [`ToolRegistry::load`]):
-//! 1. Register built-in hardware tools (`gpio_read`, `gpio_write`).
-//! 2. Scan `~/.zeroclaw/tools/` for user plugin manifests.
-//! 3. Build a `SubprocessTool` for each valid manifest and register it.
-//! 4. Print the startup log summarising loaded tools and connected devices.
-//!
-//! Dispatch flow (called per LLM tool-call):
-//! ```text
-//! registry.dispatch("gpio_write", {"device":"pico0","pin":25,"value":1})
-//!     │
-//!     ├── look up "gpio_write" in tools HashMap
-//!     └── tool.execute(args) → ToolResult
-//! ```
-//!
-//! Device lookup is handled internally by each tool (GPIO tools read the
-//! [`DeviceRegistry`] themselves via their `Arc<RwLock<DeviceRegistry>>`).
 
 use super::device::DeviceRegistry;
 use super::gpio::gpio_tools;
@@ -46,7 +26,6 @@ pub enum ToolError {
 // ── ToolRegistry ──────────────────────────────────────────────────────────────
 
 /// Central registry of all available tools (built-ins + user plugins).
-///
 /// Cheaply cloneable via the inner `Arc` — wrapping in an outer `Arc` is not
 /// needed in most call sites.
 pub struct ToolRegistry {
@@ -57,13 +36,6 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Load the registry at startup.
-    ///
-    /// 1. Instantiates the built-in GPIO tools.
-    /// 2. Scans `~/.zeroclaw/tools/` for user plugins and registers each one.
-    /// 3. Prints the startup log.
-    ///
-    /// Plugin loading errors are logged as warnings and never abort startup.
     pub async fn load(devices: Arc<RwLock<DeviceRegistry>>) -> anyhow::Result<Self> {
         let mut tools: HashMap<String, Box<dyn Tool>> = HashMap::new();
 
@@ -103,35 +75,13 @@ impl ToolRegistry {
             }
         }
 
-        // Aardvark I2C / SPI / GPIO tools + datasheet tool (hardware feature only,
-        // and only when at least one Aardvark adapter is present at startup).
-        #[cfg(feature = "hardware")]
-        {
-            let has_aardvark = {
-                let reg = devices.read().await;
-                reg.has_aardvark()
-            };
-            if has_aardvark {
-                for tool in super::aardvark_tools::aardvark_tools(devices.clone()) {
-                    let name = tool.name().to_string();
-                    if tools.contains_key(&name) {
-                        anyhow::bail!("duplicate built-in tool name: '{}'", name);
-                    }
-                    println!("[registry] loaded built-in: {}", name);
-                    tools.insert(name, tool);
-                }
-                // Datasheet tool: always useful once an Aardvark is connected.
-                {
-                    let tool: Box<dyn Tool> = Box::new(super::datasheet::DatasheetTool::new());
-                    let name = tool.name().to_string();
-                    if tools.contains_key(&name) {
-                        anyhow::bail!("duplicate built-in tool name: '{}'", name);
-                    }
-                    println!("[registry] loaded built-in: {}", name);
-                    tools.insert(name, tool);
-                }
-            }
-        }
+        // `datasheet` used to register here, gated on an Aardvark adapter being
+        // present at startup. That adapter support is gone, so the gate could
+        // never be satisfied and the registration is removed with it. The
+        // `datasheet` module itself is retained: no production entrypoint reaches
+        // this registry, because the CLI and daemon build hardware tools through
+        // `peripherals::create_peripheral_tools`, so registering the tool belongs
+        // with that factory rather than here.
 
         // ── 2. User plugins ───────────────────────────────────────────────
         let plugins = scan_plugin_dir();
@@ -170,19 +120,6 @@ impl ToolRegistry {
         })
     }
 
-    /// Returns a JSON Schema array for **all** registered tools.
-    ///
-    /// Each element follows the shape the LLM expects for function calling:
-    /// ```json
-    /// {
-    ///   "name": "gpio_write",
-    ///   "description": "...",
-    ///   "parameters": { "type": "object", "properties": { ... }, "required": [...] }
-    /// }
-    /// ```
-    ///
-    /// Inject the result of this method into the LLM system prompt so the
-    /// model knows what tools exist and how to call them.
     pub fn schemas(&self) -> Vec<serde_json::Value> {
         let mut schemas: Vec<serde_json::Value> = self
             .tools
@@ -208,7 +145,6 @@ impl ToolRegistry {
     }
 
     /// Dispatch a tool call from the LLM.
-    ///
     /// Looks up the tool by `name` and delegates to `tool.execute(args)`.
     /// Returns [`ToolError::UnknownTool`] when no matching tool is found.
     pub async fn dispatch(
@@ -248,11 +184,6 @@ impl ToolRegistry {
         self.device_registry.clone()
     }
 
-    /// Consume the registry and return all tools as a `Vec`.
-    ///
-    /// Used by [`crate::boot`] to hand tools off to the agent loop,
-    /// which manages its own flat `Vec<Box<dyn Tool>>` registry.
-    /// Order is alphabetical by tool name for deterministic output.
     pub fn into_tools(self) -> Vec<Box<dyn Tool>> {
         let mut pairs: Vec<(String, Box<dyn Tool>)> = self.tools.into_iter().collect();
         pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -288,9 +219,6 @@ mod tests {
         assert!(registry.len() >= 2);
     }
 
-    /// With the `hardware` feature, the built-in tools must match the canonical
-    /// catalog (`catalog::BASE_TOOLS`) exactly — that list is the single source
-    /// the docs render and this test enforces.
     #[cfg(feature = "hardware")]
     #[tokio::test]
     async fn hardware_feature_registers_catalog_base_tools() {

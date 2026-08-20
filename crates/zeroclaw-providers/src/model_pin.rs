@@ -12,20 +12,84 @@ pub struct ModelPinnedProvider {
     inner: Box<dyn ModelProvider>,
 }
 
-impl ModelPinnedProvider {
-    pub fn new(alias: &str, pinned_model: &str, inner: Box<dyn ModelProvider>) -> Self {
-        Self {
-            alias: alias.to_string(),
-            pinned_model: pinned_model.to_string(),
-            inner,
+/// Typed builder for [`ModelPinnedProvider`].
+///
+/// `alias` is the only positional argument. Both `pinned_model` and
+/// `inner` are semantically required at `build()` time; they moved off
+/// `new(...)` because two adjacent `&str` positional args (`alias` and
+/// `pinned_model`) had a real swap-risk surface — silently pinning the
+/// wrong provider to the wrong model.
+#[must_use]
+pub struct ModelPinnedProviderBuilder {
+    alias: String,
+    pinned_model: Option<String>,
+    inner: Option<Box<dyn ModelProvider>>,
+}
+
+impl ModelPinnedProviderBuilder {
+    /// The model ID every request to this provider is rewritten to.
+    /// Required.
+    pub fn pinned_model(mut self, model: &str) -> Self {
+        self.pinned_model = Some(model.to_string());
+        self
+    }
+
+    /// The inner provider whose model this pin overrides. Required.
+    pub fn inner(mut self, inner: Box<dyn ModelProvider>) -> Self {
+        self.inner = Some(inner);
+        self
+    }
+
+    /// # Panics
+    /// Panics if [`Self::pinned_model`] or [`Self::inner`] was not
+    /// called — neither has a sensible default.
+    pub fn build(self) -> ModelPinnedProvider {
+        ModelPinnedProvider {
+            alias: self.alias,
+            pinned_model: self
+                .pinned_model
+                .expect("ModelPinnedProviderBuilder: pinned_model() is required"),
+            inner: self
+                .inner
+                .expect("ModelPinnedProviderBuilder: inner() is required"),
         }
+    }
+}
+
+impl ModelPinnedProvider {
+    /// Entry point. Only `alias` is taken positionally; the required
+    /// `pinned_model` and `inner` provider both go through labelled
+    /// chain methods so call sites cannot silently swap them.
+    pub fn builder(alias: &str) -> ModelPinnedProviderBuilder {
+        ModelPinnedProviderBuilder {
+            alias: alias.to_string(),
+            pinned_model: None,
+            inner: None,
+        }
+    }
+
+    pub(crate) fn pinned_model(&self) -> &str {
+        &self.pinned_model
     }
 }
 
 #[async_trait]
 impl ModelProvider for ModelPinnedProvider {
+    fn has_stable_request_identity(&self, model: &str) -> bool {
+        model == self.pinned_model && self.inner.has_stable_request_identity(&self.pinned_model)
+    }
+
     fn capabilities(&self) -> super::traits::ProviderCapabilities {
         self.inner.capabilities()
+    }
+
+    fn capabilities_for_model(&self, _model: &str) -> super::traits::ProviderCapabilities {
+        self.inner.capabilities_for_model(&self.pinned_model)
+    }
+
+    fn has_mixed_native_tool_support_for_model(&self, _model: &str) -> bool {
+        self.inner
+            .has_mixed_native_tool_support_for_model(&self.pinned_model)
     }
 
     fn default_temperature(&self) -> f64 {
@@ -175,5 +239,70 @@ impl zeroclaw_api::attribution::Attributable for ModelPinnedProvider {
     }
     fn alias(&self) -> &str {
         &self.alias
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::ProviderCapabilities;
+
+    struct ModelAwareCapabilityProvider;
+
+    impl zeroclaw_api::attribution::Attributable for ModelAwareCapabilityProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "model_aware_capability"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ModelAwareCapabilityProvider {
+        fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: model == "pinned-model",
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+            model == "pinned-model"
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn capability_queries_use_the_pinned_model() {
+        let provider = ModelPinnedProvider::builder("pinned")
+            .pinned_model("pinned-model")
+            .inner(Box::new(ModelAwareCapabilityProvider))
+            .build();
+
+        assert!(
+            provider
+                .capabilities_for_model("ignored-request-model")
+                .native_tool_calling,
+            "model-aware capabilities must be queried with the pinned model"
+        );
+        assert!(
+            provider.has_mixed_native_tool_support_for_model("ignored-request-model"),
+            "mixed-chain detection must be queried with the pinned model"
+        );
     }
 }

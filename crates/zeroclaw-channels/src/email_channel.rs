@@ -40,12 +40,6 @@ pub use zeroclaw_config::scattered_types::EmailConfig;
 // `zeroclaw_tools::email_imap`, the canonical IMAP utility shared by the
 // read-only email tools. Imported here so there is a single definition.
 
-/// Email channel — IMAP IDLE for instant push notifications, SMTP for outbound.
-///
-/// Inbound sender authorization lives in `peer_groups` in V3; this channel
-/// resolves the authorized senders at message-time via [`Self::peer_resolver`]
-/// rather than reading a per-channel `allowed_senders` field (it no longer
-/// exists on `EmailConfig`).
 pub struct EmailChannel {
     pub config: EmailConfig,
     /// The alias key under `[channels.email.<alias>]` this handle is
@@ -83,26 +77,11 @@ impl EmailChannel {
         self
     }
 
-    /// Check if a sender email is in the allowlist (peer group).
-    ///
-    /// Email allowlist entries support three syntaxes — preserved from
-    /// the legacy `EmailConfig::allowed_senders` semantics:
-    /// - `*`                wildcard, allow anyone.
-    /// - `user@host`        full address, case-insensitive.
-    /// - `@host` / `host`   domain match, case-insensitive.
     pub fn is_sender_allowed(&self, email: &str) -> bool {
         let peers = (self.peer_resolver)();
         Self::is_email_sender_allowed(&peers, email)
     }
 
-    /// Pure, testable predicate that applies the email-allowlist match
-    /// semantics against an already-resolved peer list.
-    ///
-    /// Domain-class email matching (`@host` / bare `host` admit a whole
-    /// domain; `user@host` is a full case-insensitive address) can't be
-    /// expressed by the `crate::allowlist::Match` modes, so the per-entry
-    /// comparison runs through `crate::allowlist::is_user_allowed_by`. `peers`
-    /// is the caller's freshly-resolved list; no allowlist state is cached.
     fn is_email_sender_allowed(peers: &[String], email: &str) -> bool {
         crate::allowlist::is_user_allowed_by(peers, email, |allowed, email| {
             let email_lower = email.to_lowercase();
@@ -151,6 +130,33 @@ impl EmailChannel {
             .unwrap_or_else(|| "unknown".into())
     }
 
+    /// Extract the Reply-To address from a parsed email, if present.
+    fn extract_reply_to(parsed: &mail_parser::Message) -> Option<String> {
+        parsed
+            .reply_to()
+            .and_then(|addr| addr.first())
+            .and_then(|a| a.address())
+            .map(|s| s.to_string())
+    }
+
+    /// Extract the References chain (parent message-ids) from a parsed email.
+    ///
+    /// Per RFC 5322 §3.6.4, a reply's References chain is built from the parent's
+    /// `References` header when present; otherwise, if the parent carries an
+    /// `In-Reply-To` with a single message-id, that id stands in for the chain.
+    /// Falling back preserves the thread's ancestry for MUAs that set only
+    /// `In-Reply-To`.
+    fn extract_references(parsed: &mail_parser::Message) -> Vec<String> {
+        if let Some(refs) = parsed.references().as_text_list() {
+            return refs.iter().map(|id| id.to_string()).collect();
+        }
+        // Fall back to a single-id In-Reply-To (RFC 5322 §3.6.4).
+        match parsed.in_reply_to().as_text_list() {
+            Some(ids) if ids.len() == 1 => vec![ids[0].to_string()],
+            _ => Vec::new(),
+        }
+    }
+
     /// Extract readable text from a parsed email
     fn extract_text(parsed: &mail_parser::Message) -> String {
         if let Some(text) = parsed.body_text(0) {
@@ -186,7 +192,7 @@ impl EmailChannel {
             let mime_str =
                 ct.map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")));
 
-            // Skip text parts — already handled by extract_text()
+            // Skip text parts — already handled by extract_text
             if let Some(ref m) = mime_str
                 && m.starts_with("text/")
             {
@@ -274,12 +280,6 @@ impl EmailChannel {
         let raw_stream = tls_connector.connect(sni.into(), tcp).await?;
         let stream = TlsStreamTolerant(raw_stream);
 
-        // Create IMAP client and consume the server greeting.
-        // async-imap requires the caller to read the greeting before issuing
-        // any commands (see async-imap docs). login() tolerates a missing
-        // explicit read because check_done_ok_from() loops past untagged
-        // responses — but do_auth_handshake() used by authenticate() does not,
-        // so without this the XOAUTH2 exchange deadlocks on the greeting line.
         let mut client = async_imap::Client::new(stream);
         client
             .read_response()
@@ -351,11 +351,6 @@ impl EmailChannel {
     /// Bounds peak memory when the mailbox has a large unseen backlog.
     const MAX_FETCH_BATCH: usize = 10;
 
-    /// Defense in depth: keep the reserved SOP-ingress subject namespace
-    /// out of user-fillable email subjects. The orchestrator no longer
-    /// routes on `subject` (it keys on an internal producer-only marker),
-    /// but stripping the prefix here means the reserved string can never
-    /// originate from an inbound email at all.
     fn sanitize_subject(subject: &str) -> String {
         let mut cleaned = subject;
         while let Some(rest) =
@@ -377,6 +372,8 @@ impl EmailChannel {
         uid_validity: Option<u32>,
     ) -> ParsedEmail {
         let sender = Self::extract_sender(parsed);
+        let reply_to = Self::extract_reply_to(parsed);
+        let references = Self::extract_references(parsed);
         let subject = Self::sanitize_subject(parsed.subject().unwrap_or("(no subject)"));
         let body_text = Self::extract_text(parsed);
         let content = format!("Subject: {}\n\n{}", subject, body_text);
@@ -410,6 +407,8 @@ impl EmailChannel {
         ParsedEmail {
             msg_id,
             sender,
+            reply_to,
+            references,
             subject,
             content,
             timestamp,
@@ -558,7 +557,7 @@ impl EmailChannel {
     }
 
     /// Run the IDLE loop, returning when a new message arrives or timeout
-    /// Note: IDLE consumes the session and returns it via done()
+    /// Note: IDLE consumes the session and returns it via done
     async fn wait_for_changes(
         &self,
         session: ImapSession,
@@ -625,11 +624,6 @@ impl EmailChannel {
         }
     }
 
-    /// Main listen loop with automatic reconnection.
-    ///
-    /// Probes the server's CAPABILITY list after login and picks between:
-    /// - IMAP IDLE (RFC 2177) for instant push when the server advertises it.
-    /// - Periodic polling when the server does not support IDLE (e.g. seznam.cz).
     async fn listen_with_reconnect(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(60);
@@ -665,11 +659,6 @@ impl EmailChannel {
         let mailbox = session.select(&self.config.imap_folder).await?;
         let uid_validity = mailbox.uid_validity;
 
-        // In observer mode: capture uid_next so we only ever process emails that
-        // arrive AFTER this session starts. No startup drain, no flag changes.
-        //
-        // In active mode: drain UNSEEN messages on startup (RFC822 implicitly
-        // sets \Seen), then track via uid_next for subsequent messages.
         let uid_threshold = if self.config.observer_mode {
             let threshold = mailbox.uid_next.unwrap_or(1);
             ::zeroclaw_log::record!(
@@ -805,9 +794,22 @@ impl EmailChannel {
         if !is_new {
             return Ok(true);
         }
+        let reply_target = match email.reply_to.as_ref() {
+            Some(reply_to) if self.is_sender_allowed(reply_to) => reply_to.clone(),
+            Some(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Ignoring email Reply-To because the destination is not allowlisted"
+                );
+                email.sender.clone()
+            }
+            None => email.sender.clone(),
+        };
         let msg = ChannelMessage {
             id: email.msg_id,
-            reply_target: email.sender.clone(),
+            reply_target,
             sender: email.sender,
             content: email.content,
             channel: "email".to_string(),
@@ -817,6 +819,7 @@ impl EmailChannel {
             interruption_scope_id: None,
             attachments: email.attachments,
             subject: Some(email.subject),
+            references: email.references,
 
             ..Default::default()
         };
@@ -868,12 +871,84 @@ impl EmailChannel {
         };
         Ok(transport)
     }
+
+    /// Build the outbound `lettre` message for a `SendMessage`, including
+    /// subject/body derivation, attachments, and reply threading headers
+    /// (`In-Reply-To` / `References`). Pure and side-effect free so it can be
+    /// tested without a live SMTP transport. `pub(crate)` so orchestrator
+    /// boundary tests can assert the serialized wire form of replies built
+    /// from inbound channel messages.
+    pub(crate) fn build_email_message(&self, message: &SendMessage) -> Result<Message> {
+        // Use explicit subject if provided, otherwise fall back to legacy parsing or default
+        let default_subject = self.config.default_subject.as_str();
+        let (subject, body) = if let Some(ref subj) = message.subject {
+            (subj.as_str(), message.content.as_str())
+        } else if message.content.starts_with("Subject: ") {
+            if let Some(pos) = message.content.find('\n') {
+                (&message.content[9..pos], message.content[pos + 1..].trim())
+            } else {
+                (default_subject, message.content.as_str())
+            }
+        } else {
+            (default_subject, message.content.as_str())
+        };
+
+        let mut builder = Message::builder()
+            .from(self.config.from_address.parse()?)
+            .to(message.recipient.parse()?)
+            .subject(subject);
+        if let Some(ref reply_id) = message.in_reply_to
+            && !is_synthetic_email_message_id(reply_id)
+        {
+            builder = builder.in_reply_to(angle_wrap_message_id(reply_id));
+        }
+        let references: Vec<String> = message
+            .references
+            .iter()
+            .filter(|id| !is_synthetic_email_message_id(id))
+            .map(|id| angle_wrap_message_id(id))
+            .collect();
+        if !references.is_empty() {
+            builder = builder.references(references.join(" "));
+        }
+        let att_parts = build_attachment_parts(&message.attachments);
+
+        let email = if self.config.html_body {
+            let alt = MultiPart::alternative()
+                .singlepart(SinglePart::plain(body.to_string()))
+                .singlepart(SinglePart::html(markdown_to_html(body)));
+            if att_parts.is_empty() {
+                builder.multipart(alt)?
+            } else {
+                let mut mixed = MultiPart::mixed().multipart(alt);
+                for part in att_parts {
+                    mixed = mixed.singlepart(part);
+                }
+                builder.multipart(mixed)?
+            }
+        } else {
+            let plain = SinglePart::plain(body.to_string());
+            if att_parts.is_empty() {
+                builder.singlepart(plain)?
+            } else {
+                let mut mixed = MultiPart::mixed().singlepart(plain);
+                for part in att_parts {
+                    mixed = mixed.singlepart(part);
+                }
+                builder.multipart(mixed)?
+            }
+        };
+
+        Ok(email)
+    }
 }
 
 /// Internal struct for parsed email data
 struct ParsedEmail {
     msg_id: String,
     sender: String,
+    reply_to: Option<String>,
+    references: Vec<String>,
     subject: String,
     content: String,
     timestamp: u64,
@@ -914,6 +989,19 @@ fn is_synthetic_email_message_id(value: &str) -> bool {
     value.starts_with("email-imap-") || value.starts_with("email-fallback-")
 }
 
+/// Wrap a bare message-id in RFC 5322 angle brackets for `In-Reply-To` /
+/// `References` headers. `mail_parser` strips the brackets on parse and `lettre`
+/// emits these headers verbatim, so ids must be re-wrapped on the way out.
+/// Idempotent: an id that already carries brackets is left unchanged.
+fn angle_wrap_message_id(id: &str) -> String {
+    let trimmed = id.trim();
+    if trimmed.starts_with('<') && trimmed.ends_with('>') {
+        trimmed.to_string()
+    } else {
+        format!("<{trimmed}>")
+    }
+}
+
 #[async_trait]
 
 impl Channel for EmailChannel {
@@ -932,73 +1020,7 @@ impl Channel for EmailChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        // Use explicit subject if provided, otherwise fall back to legacy parsing or default
-        let default_subject = self.config.default_subject.as_str();
-        let (subject, body) = if let Some(ref subj) = message.subject {
-            (subj.as_str(), message.content.as_str())
-        } else if message.content.starts_with("Subject: ") {
-            if let Some(pos) = message.content.find('\n') {
-                (&message.content[9..pos], message.content[pos + 1..].trim())
-            } else {
-                (default_subject, message.content.as_str())
-            }
-        } else {
-            (default_subject, message.content.as_str())
-        };
-
-        let mut builder = Message::builder()
-            .from(self.config.from_address.parse()?)
-            .to(message.recipient.parse()?)
-            .subject(subject);
-        if let Some(ref reply_id) = message.in_reply_to
-            && !is_synthetic_email_message_id(reply_id)
-        {
-            builder = builder.in_reply_to(reply_id.clone());
-        }
-        let mut att_parts: Vec<(String, Vec<u8>, ContentType)> = Vec::new();
-        for att in &message.attachments {
-            let content_type = att
-                .mime_type
-                .as_deref()
-                .and_then(|m| ContentType::parse(m).ok())
-                .unwrap_or_else(|| {
-                    ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
-                });
-            let att_data = resolve_attachment_data(&att.file_name, &att.data)?;
-            let att_name = std::path::Path::new(&att.file_name)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&att.file_name)
-                .to_string();
-            att_parts.push((att_name, att_data, content_type));
-        }
-
-        let email = if self.config.html_body {
-            let alt = MultiPart::alternative()
-                .singlepart(SinglePart::plain(body.to_string()))
-                .singlepart(SinglePart::html(markdown_to_html(body)));
-            if att_parts.is_empty() {
-                builder.multipart(alt)?
-            } else {
-                let mut mixed = MultiPart::mixed().multipart(alt);
-                for (name, data, ct) in att_parts {
-                    mixed = mixed.singlepart(Attachment::new(name).body(data, ct));
-                }
-                builder.multipart(mixed)?
-            }
-        } else {
-            let plain = SinglePart::plain(body.to_string());
-            if att_parts.is_empty() {
-                builder.singlepart(plain)?
-            } else {
-                let mut mixed = MultiPart::mixed().singlepart(plain);
-                for (name, data, ct) in att_parts {
-                    mixed = mixed.singlepart(Attachment::new(name).body(data, ct));
-                }
-                builder.multipart(mixed)?
-            }
-        };
-
+        let email = self.build_email_message(message)?;
         let transport = self.create_smtp_transport()?;
         transport.send(&email)?;
         ::zeroclaw_log::record!(
@@ -1053,33 +1075,28 @@ impl Channel for EmailChannel {
     }
 }
 
-/// Resolve the byte content of an attachment for sending.
-///
-/// # Trust boundary
-///
-/// `file_name` is treated as a file-system path **only** when `data` is empty.
-/// This fallback exists exclusively for internally constructed
-/// [`MediaAttachment`](zeroclaw_api::media::MediaAttachment) values whose
-/// bytes were intentionally omitted (e.g. created via
-/// [`MediaAttachment::from_file`](zeroclaw_api::media::MediaAttachment::from_file)
-/// after a round-trip through serialization).  Callers that build attachments
-/// from untrusted input — user messages, HTTP request bodies, or any external
-/// data source — **must** validate or constrain `file_name` before reaching
-/// this function; no additional path sanitization is applied here.
-///
-/// Read errors are propagated rather than silently suppressed.
-fn resolve_attachment_data(file_name: &str, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if data.is_empty() && std::path::Path::new(file_name).exists() {
-        std::fs::read(file_name).map_err(|e| {
-            anyhow::Error::msg(format!("failed to read attachment '{}': {}", file_name, e))
+fn build_attachment_parts(attachments: &[zeroclaw_api::media::MediaAttachment]) -> Vec<SinglePart> {
+    attachments
+        .iter()
+        .map(|attachment| {
+            let content_type = attachment
+                .mime_type
+                .as_deref()
+                .and_then(|mime| ContentType::parse(mime).ok())
+                .unwrap_or_else(|| {
+                    ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
+                });
+            let name = std::path::Path::new(&attachment.file_name)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&attachment.file_name)
+                .to_string();
+            Attachment::new(name).body(attachment.data.clone(), content_type)
         })
-    } else {
-        Ok(data.to_vec())
-    }
+        .collect()
 }
 
 /// Build the SASL XOAUTH2 initial client response for IMAP `AUTHENTICATE`.
-///
 /// Format per the XOAUTH2 spec: `user=<user>^Aauth=Bearer <token>^A^A`,
 /// where `^A` is the `0x01` control byte. The transport base64-encodes this.
 fn xoauth2_sasl_response(user: &str, token: &str) -> String {
@@ -1105,8 +1122,6 @@ mod tests {
 
     #[test]
     fn sanitize_subject_strips_reserved_sop_prefix() {
-        // Defense in depth: an inbound email must not be able to carry the
-        // reserved SOP-ingress subject namespace.
         let forged = "zeroclaw:sop-event:git.main:pull_request.opened";
         let cleaned = super::EmailChannel::sanitize_subject(forged);
         assert!(
@@ -1150,69 +1165,74 @@ mod tests {
     }
     use super::*;
 
-    // -- resolve_attachment_data tests --
+    // -- build_attachment_parts tests --
+
+    fn outbound_attachment(
+        file_name: impl Into<String>,
+        data: Vec<u8>,
+    ) -> zeroclaw_api::media::MediaAttachment {
+        zeroclaw_api::media::MediaAttachment {
+            file_name: file_name.into(),
+            data,
+            mime_type: None,
+        }
+    }
+
+    fn rendered_attachment(attachment: zeroclaw_api::media::MediaAttachment) -> Vec<u8> {
+        let mut parts = build_attachment_parts(&[attachment]);
+        let email = Message::builder()
+            .from("sender@example.invalid".parse().unwrap())
+            .to("recipient@example.invalid".parse().unwrap())
+            .subject("attachment boundary")
+            .multipart(MultiPart::mixed().singlepart(parts.remove(0)))
+            .unwrap();
+        let formatted = email.formatted();
+        let parsed = MessageParser::default()
+            .parse(formatted.as_slice())
+            .unwrap();
+        parsed.attachments().next().unwrap().contents().to_vec()
+    }
 
     #[test]
-    fn resolve_attachment_data_returns_provided_bytes_when_non_empty() {
+    fn build_attachment_parts_serializes_provided_bytes() {
         let data = b"hello attachment".to_vec();
-        let result = resolve_attachment_data("ignored.bin", &data).unwrap();
+        let result = rendered_attachment(outbound_attachment("ignored.bin", data.clone()));
         assert_eq!(result, data);
     }
 
     #[test]
-    fn resolve_attachment_data_falls_back_to_file_when_data_empty_and_file_exists() {
+    fn build_attachment_parts_does_not_read_existing_file_when_data_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("att.txt");
         std::fs::write(&path, b"file contents").unwrap();
-        let result = resolve_attachment_data(path.to_str().unwrap(), &[]).unwrap();
-        assert_eq!(result, b"file contents");
+        let result = rendered_attachment(outbound_attachment(path.display().to_string(), vec![]));
+        assert!(result.is_empty());
     }
 
     #[test]
-    fn resolve_attachment_data_returns_empty_when_data_empty_and_file_absent() {
+    fn build_attachment_parts_keeps_empty_data_for_absent_file_name() {
         // file_name does not exist on disk — should return empty vec, not error.
         // Use a temp dir to guarantee the path does not exist, rather than a
         // hard-coded /tmp path, for portability.
         let dir = tempfile::tempdir().unwrap();
         let absent = dir.path().join("does-not-exist.bin");
-        let result = resolve_attachment_data(absent.to_str().unwrap(), &[]).unwrap();
+        let result = rendered_attachment(outbound_attachment(absent.display().to_string(), vec![]));
         assert!(result.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn resolve_attachment_data_propagates_read_error_on_unreadable_file() {
-        // Create a file, then make it unreadable (Unix only).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("locked.bin");
-            std::fs::write(&path, b"secret").unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            // Permission enforcement is not guaranteed when running as root;
-            // skip rather than produce a false failure.  Reading from
-            // /proc/self/status is Linux-specific but that is where this test
-            // is most likely to run.  On other Unix systems the check falls
-            // back to the USER env var, which is a best-effort heuristic only.
-            #[cfg(target_os = "linux")]
-            let is_root = std::fs::read_to_string("/proc/self/status")
-                .ok()
-                .and_then(|s| {
-                    s.lines()
-                        .find(|l| l.starts_with("Uid:"))
-                        .and_then(|l| l.split_whitespace().nth(1))
-                        .and_then(|uid| uid.parse::<u32>().ok())
-                })
-                .map(|uid| uid == 0)
-                .unwrap_or(false);
-            #[cfg(not(target_os = "linux"))]
-            let is_root = std::env::var("USER").map(|u| u == "root").unwrap_or(false);
-            if is_root {
-                return;
-            }
-            let result = resolve_attachment_data(path.to_str().unwrap(), &[]);
-            assert!(result.is_err());
-        }
+    fn build_attachment_parts_does_not_follow_symlink_when_data_empty() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secret.txt");
+        let link = dir.path().join("attachment.txt");
+        std::fs::write(&target, b"secret contents").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let result = rendered_attachment(outbound_attachment(link.display().to_string(), vec![]));
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -1293,12 +1313,6 @@ mod tests {
         assert_eq!(config.from_address, "");
         assert_eq!(config.idle_timeout_secs, 1740);
     }
-
-    // EmailChannel tests
-    //
-    // Inbound peer authorization lives in `peer_groups` in V3; the
-    // channel resolves the authorized senders via a peer_resolver
-    // closure provided at construction.
 
     fn empty_resolver() -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
         Arc::new(Vec::new)
@@ -1395,6 +1409,138 @@ mod tests {
 
     fn parse_test_email(raw: &'static [u8]) -> mail_parser::Message<'static> {
         MessageParser::default().parse(raw).unwrap()
+    }
+
+    // -- extract_attachments tests --
+
+    fn attachment_config(max_attachment_bytes: usize) -> EmailConfig {
+        EmailConfig {
+            max_attachment_bytes,
+            ..mailbox_identity_config()
+        }
+    }
+
+    #[test]
+    fn extract_attachments_returns_binary_parts_with_name_and_mime() {
+        let channel = EmailChannel::new(
+            attachment_config(default_max_attachment_bytes()),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let parsed = parse_test_email(
+            b"From: sender@example.invalid\r\n\
+              To: recipient@example.invalid\r\n\
+              Subject: Test with attachments\r\n\
+              MIME-Version: 1.0\r\n\
+              Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+              \r\n\
+              --BOUNDARY\r\n\
+              Content-Type: text/plain\r\n\
+              \r\n\
+              Email body text\r\n\
+              --BOUNDARY\r\n\
+              Content-Type: application/pdf\r\n\
+              Content-Disposition: attachment; filename=\"document.pdf\"\r\n\
+              \r\n\
+              PDF_BINARY_DATA\r\n\
+              --BOUNDARY\r\n\
+              Content-Type: image/png\r\n\
+              Content-Disposition: attachment; filename=\"photo.png\"\r\n\
+              \r\n\
+              PNG_BINARY_DATA\r\n\
+              --BOUNDARY--\r\n",
+        );
+
+        let attachments = channel.extract_attachments(&parsed);
+
+        // The text/plain body part is not an attachment; the PDF and PNG are.
+        assert_eq!(attachments.len(), 2);
+
+        let pdf = attachments
+            .iter()
+            .find(|a| a.file_name == "document.pdf")
+            .expect("pdf attachment");
+        assert_eq!(pdf.mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(pdf.data, b"PDF_BINARY_DATA");
+
+        let png = attachments
+            .iter()
+            .find(|a| a.file_name == "photo.png")
+            .expect("png attachment");
+        assert_eq!(png.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(png.data, b"PNG_BINARY_DATA");
+    }
+
+    #[test]
+    fn extract_attachments_skips_text_parts() {
+        let channel = EmailChannel::new(
+            attachment_config(default_max_attachment_bytes()),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        // `notes.txt` carries Content-Disposition: attachment, so mail_parser
+        // yields it from `attachments()` — this is what reaches the `text/`
+        // guard. A bare text/plain body part never gets that far.
+        let parsed = parse_test_email(
+            b"From: sender@example.invalid\r\n\
+              To: recipient@example.invalid\r\n\
+              Subject: Text attachment\r\n\
+              MIME-Version: 1.0\r\n\
+              Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+              \r\n\
+              --BOUNDARY\r\n\
+              Content-Type: text/plain\r\n\
+              \r\n\
+              Plain text body\r\n\
+              --BOUNDARY\r\n\
+              Content-Type: text/plain\r\n\
+              Content-Disposition: attachment; filename=\"notes.txt\"\r\n\
+              \r\n\
+              attached text file\r\n\
+              --BOUNDARY\r\n\
+              Content-Type: application/pdf\r\n\
+              Content-Disposition: attachment; filename=\"document.pdf\"\r\n\
+              \r\n\
+              PDF_BINARY_DATA\r\n\
+              --BOUNDARY--\r\n",
+        );
+
+        let attachments = channel.extract_attachments(&parsed);
+
+        // Only the PDF survives; every text/* part is left to extract_text.
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].file_name, "document.pdf");
+        assert!(!attachments.iter().any(|a| a.file_name == "notes.txt"));
+    }
+
+    #[test]
+    fn extract_attachments_drops_parts_past_configured_size_limit() {
+        let mut raw = String::from(
+            "From: sender@example.invalid\r\n\
+             To: recipient@example.invalid\r\n\
+             Subject: Large attachment\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+             \r\n\
+             --BOUNDARY\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             Body\r\n\
+             --BOUNDARY\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-Disposition: attachment; filename=\"large.bin\"\r\n\
+             \r\n",
+        );
+        raw.push_str(&"X".repeat(150));
+        raw.push_str("\r\n--BOUNDARY--\r\n");
+        let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
+
+        // The limit is read from EmailConfig, the same field production uses.
+        let under = EmailChannel::new(attachment_config(100), "email_test_alias", empty_resolver());
+        assert!(under.extract_attachments(&parsed).is_empty());
+
+        let over = EmailChannel::new(attachment_config(200), "email_test_alias", empty_resolver());
+        assert_eq!(over.extract_attachments(&parsed).len(), 1);
     }
 
     #[test]
@@ -1533,6 +1679,257 @@ mod tests {
     }
 
     #[test]
+    fn build_parsed_email_captures_reply_to_and_references() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let parsed = parse_test_email(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Reply-To: replies@example.invalid\r\n\
+              References: <first@example.invalid> <second@example.invalid>\r\n\
+              Subject: Threaded\r\n\
+              \r\n\
+              hello",
+        );
+
+        let email = channel.build_parsed_email(&parsed, 42, Some(1234));
+
+        assert_eq!(email.reply_to.as_deref(), Some("replies@example.invalid"));
+        assert_eq!(
+            email.references,
+            vec![
+                "first@example.invalid".to_string(),
+                "second@example.invalid".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn build_parsed_email_without_reply_to_leaves_fields_empty() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let parsed = parse_test_email(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Subject: No Reply-To\r\n\
+              \r\n\
+              hello",
+        );
+
+        let email = channel.build_parsed_email(&parsed, 42, Some(1234));
+
+        assert!(email.reply_to.is_none());
+        assert!(email.references.is_empty());
+    }
+
+    #[test]
+    fn build_parsed_email_falls_back_to_in_reply_to_when_references_absent() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        // A parent that set only In-Reply-To (no References) — the ancestry must
+        // still be preserved (RFC 5322 §3.6.4).
+        let parsed = parse_test_email(
+            b"From: Sender <sender@example.invalid>\r\n\
+              In-Reply-To: <ancestor@example.invalid>\r\n\
+              Subject: Only In-Reply-To\r\n\
+              \r\n\
+              hello",
+        );
+
+        let email = channel.build_parsed_email(&parsed, 42, Some(1234));
+
+        assert_eq!(
+            email.references,
+            vec!["ancestor@example.invalid".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_parsed_email_prefers_references_over_in_reply_to() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let parsed = parse_test_email(
+            b"From: Sender <sender@example.invalid>\r\n\
+              References: <root@example.invalid> <mid@example.invalid>\r\n\
+              In-Reply-To: <mid@example.invalid>\r\n\
+              Subject: Both\r\n\
+              \r\n\
+              hello",
+        );
+
+        let email = channel.build_parsed_email(&parsed, 42, Some(1234));
+
+        assert_eq!(
+            email.references,
+            vec![
+                "root@example.invalid".to_string(),
+                "mid@example.invalid".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_email_uses_reply_to_for_reply_target_and_carries_references() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            resolver_from(vec!["@example.invalid".to_string()]),
+        );
+        let parsed = parse_test_email(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Reply-To: replies@example.invalid\r\n\
+              References: <first@example.invalid> <second@example.invalid>\r\n\
+              Subject: Threaded\r\n\
+              \r\n\
+              hello",
+        );
+        let email = channel.build_parsed_email(&parsed, 42, Some(1234));
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let ok = channel.dispatch_email(email, &tx).await.unwrap();
+        assert!(ok);
+
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.sender, "sender@example.invalid");
+        assert_eq!(msg.reply_target, "replies@example.invalid");
+        assert_eq!(
+            msg.references,
+            vec![
+                "first@example.invalid".to_string(),
+                "second@example.invalid".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_email_rejects_unallowlisted_reply_to() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            resolver_from(vec!["@trusted.example.invalid".to_string()]),
+        );
+        let parsed = parse_test_email(
+            b"From: Sender <sender@trusted.example.invalid>\r\n\
+              Reply-To: attacker@evil.example.invalid\r\n\
+              Subject: Redirect attempt\r\n\
+              \r\n\
+              hello",
+        );
+        let email = channel.build_parsed_email(&parsed, 42, Some(1234));
+        let (tx, mut rx) = mpsc::channel(1);
+
+        channel.dispatch_email(email, &tx).await.unwrap();
+
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.sender, "sender@trusted.example.invalid");
+        assert_eq!(msg.reply_target, "sender@trusted.example.invalid");
+    }
+
+    #[tokio::test]
+    async fn dispatch_email_without_reply_to_falls_back_to_sender() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            resolver_from(vec!["*".to_string()]),
+        );
+        let parsed = parse_test_email(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Subject: No Reply-To\r\n\
+              \r\n\
+              hello",
+        );
+        let email = channel.build_parsed_email(&parsed, 42, Some(1234));
+        let (tx, mut rx) = mpsc::channel(1);
+
+        channel.dispatch_email(email, &tx).await.unwrap();
+
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.reply_target, "sender@example.invalid");
+        assert!(msg.references.is_empty());
+    }
+
+    #[test]
+    fn build_email_message_includes_references_header_with_real_ids() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let mut message = SendMessage::new("body", "user@example.invalid")
+            .in_reply_to(Some("parent@example.invalid".to_string()));
+        message.references = vec![
+            "first@example.invalid".to_string(),
+            "parent@example.invalid".to_string(),
+        ];
+
+        let email = channel.build_email_message(&message).unwrap();
+
+        let references = email
+            .headers()
+            .get::<lettre::message::header::References>()
+            .expect("References header must be set");
+        assert_eq!(
+            references.as_ref(),
+            "<first@example.invalid> <parent@example.invalid>"
+        );
+        let in_reply_to = email
+            .headers()
+            .get::<lettre::message::header::InReplyTo>()
+            .expect("In-Reply-To header must be set");
+        assert_eq!(in_reply_to.as_ref(), "<parent@example.invalid>");
+
+        // The serialized wire form must carry RFC 5322 angle-bracketed msg-ids,
+        // otherwise strict mail clients will not thread the conversation.
+        let wire = String::from_utf8_lossy(&email.formatted()).into_owned();
+        assert!(
+            wire.contains("In-Reply-To: <parent@example.invalid>"),
+            "wire form missing bracketed In-Reply-To:\n{wire}"
+        );
+        assert!(
+            wire.contains("References: <first@example.invalid> <parent@example.invalid>"),
+            "wire form missing bracketed References:\n{wire}"
+        );
+    }
+
+    #[test]
+    fn build_email_message_omits_references_header_when_empty_or_synthetic() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+
+        let empty_message = SendMessage::new("body", "user@example.invalid");
+        let email = channel.build_email_message(&empty_message).unwrap();
+        assert!(
+            email
+                .headers()
+                .get::<lettre::message::header::References>()
+                .is_none()
+        );
+
+        let mut synthetic_message = SendMessage::new("body", "user@example.invalid");
+        synthetic_message.references = vec!["email-imap-abc123-1".to_string()];
+        let email = channel.build_email_message(&synthetic_message).unwrap();
+        assert!(
+            email
+                .headers()
+                .get::<lettre::message::header::References>()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn synthetic_email_message_ids_are_not_reply_header_ids() {
         assert!(is_synthetic_email_message_id(
             "email-imap-57c2da8dd15cdb2f2f3d118a6d636f86-42"
@@ -1543,6 +1940,22 @@ mod tests {
         assert!(!is_synthetic_email_message_id(
             "<real-message-id@example.invalid>"
         ));
+    }
+
+    #[test]
+    fn angle_wrap_message_id_wraps_bare_ids_and_is_idempotent() {
+        assert_eq!(
+            angle_wrap_message_id("msg@example.invalid"),
+            "<msg@example.invalid>"
+        );
+        assert_eq!(
+            angle_wrap_message_id("<msg@example.invalid>"),
+            "<msg@example.invalid>"
+        );
+        assert_eq!(
+            angle_wrap_message_id("  msg@example.invalid  "),
+            "<msg@example.invalid>"
+        );
     }
 
     #[tokio::test]

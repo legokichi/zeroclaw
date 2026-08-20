@@ -1,17 +1,6 @@
 //! WASM sandbox runtime — in-process tool isolation via `wasmi`.
-//!
-//! Provides capability-based sandboxing without Docker or external runtimes.
-//! Each WASM module runs with:
-//! - **Fuel limits**: prevents infinite loops (each instruction costs 1 fuel)
-//! - **Memory caps**: configurable per-module memory ceiling
-//! - **No filesystem access**: by default, tools are pure computation
-//! - **No network access**: unless explicitly allowlisted hosts are configured
-//!
-//! # Feature gate
-//! This module is only compiled when `--features runtime-wasm` is enabled.
-//! The default ZeroClaw binary excludes it to maintain the 4.6 MB size target.
 
-use super::traits::RuntimeAdapter;
+use super::traits::{RuntimeAdapter, ShellDialect};
 use zeroclaw_config::schema::WasmRuntimeConfig;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -129,11 +118,6 @@ impl WasmRuntime {
         mb.saturating_mul(1024 * 1024)
     }
 
-    /// Execute a WASM module from the tools directory.
-    ///
-    /// This is the primary entry point for running sandboxed tool code.
-    /// The module must export a `_start` function (WASI convention) or
-    /// a custom `run` function that takes no arguments and returns i32.
     #[cfg(feature = "runtime-wasm")]
     pub fn execute_module(
         &self,
@@ -280,11 +264,6 @@ impl RuntimeAdapter for WasmRuntime {
         "wasm"
     }
 
-    fn has_shell_access(&self) -> bool {
-        // WASM sandbox does NOT provide shell access — that's the point
-        false
-    }
-
     fn has_filesystem_access(&self) -> bool {
         self.config.allow_workspace_read || self.config.allow_workspace_write
     }
@@ -302,6 +281,10 @@ impl RuntimeAdapter for WasmRuntime {
 
     fn memory_budget(&self) -> u64 {
         self.config.memory_limit_mb.saturating_mul(1024 * 1024)
+    }
+
+    fn shell_dialect(&self) -> ShellDialect {
+        ShellDialect::None
     }
 
     fn build_shell_command(

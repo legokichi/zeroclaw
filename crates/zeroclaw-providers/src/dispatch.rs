@@ -1,18 +1,5 @@
 //! `ProviderDispatch` — single source of truth for `attribution_span!`
 //! on the [`ModelProvider`] surface.
-//!
-//! Every direct call to a `ModelProvider` method in the workspace goes
-//! through this helper so the resulting `LogEvent` carries the inner
-//! provider's alias-bound attribution without the call site naming any
-//! of it. Each wrapping method opens
-//! `attribution_span!(&*self.inner)` (and, for the methods that take a
-//! model string, an additional `scope!(model: …)`) around the
-//! underlying call.
-//!
-//! Adding a new `ModelProvider` method: add the wrapping method here
-//! and extend the `scripts/ci/rust_quality_gate.sh` grep gate's
-//! protected method list. The dispatch module is the only place in the
-//! workspace that opens `attribution_span!` for a `ModelProvider`.
 
 use std::sync::Arc;
 
@@ -22,6 +9,257 @@ use zeroclaw_api::model_provider::{
     StreamResult,
 };
 
+/// Immutable billing identity for one rejected attempt.
+///
+/// This is deliberately a data projection of a provider-internal attempt. It
+/// carries only the served route and token usage needed by runtime accounting.
+#[derive(Debug, Clone)]
+pub struct RejectedAttempt {
+    provider_ref: String,
+    model: String,
+    usage: crate::traits::TokenUsage,
+}
+
+impl RejectedAttempt {
+    pub(crate) fn new(
+        provider_ref: String,
+        model: String,
+        usage: crate::traits::TokenUsage,
+    ) -> Self {
+        Self {
+            provider_ref,
+            model,
+            usage,
+        }
+    }
+
+    #[must_use]
+    /// Configured provider reference used for rejected-cost attribution.
+    pub fn provider_ref(&self) -> &str {
+        &self.provider_ref
+    }
+
+    #[must_use]
+    /// Served model used for rejected-cost attribution.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    #[must_use]
+    /// Final cumulative usage snapshot for this one physical attempt.
+    pub fn usage(&self) -> &crate::traits::TokenUsage {
+        &self.usage
+    }
+
+    #[must_use]
+    /// Return an updated immutable projection for the same physical attempt.
+    ///
+    /// This replaces a cumulative snapshot; callers must not add the two
+    /// snapshots together.
+    pub fn with_usage(mut self, usage: crate::traits::TokenUsage) -> Self {
+        self.usage = usage;
+        self
+    }
+}
+
+/// Immutable actual route of a transport-successful Reliable completion.
+#[derive(Debug, Clone)]
+pub struct AcceptedRoute {
+    provider_ref: String,
+    model: String,
+    fallback: Option<crate::reliable::ProviderFallbackAttribution>,
+}
+
+impl AcceptedRoute {
+    pub(crate) fn new(
+        provider_ref: String,
+        model: String,
+        fallback: Option<crate::reliable::ProviderFallbackAttribution>,
+    ) -> Self {
+        Self {
+            provider_ref,
+            model,
+            fallback,
+        }
+    }
+
+    #[must_use]
+    /// Configured provider reference that served the accepted candidate.
+    pub fn provider_ref(&self) -> &str {
+        &self.provider_ref
+    }
+
+    #[must_use]
+    /// Served model that produced the accepted candidate.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    #[must_use]
+    /// Presentation-only fallback data, if this accepted route recovered.
+    pub fn fallback(&self) -> Option<&crate::reliable::ProviderFallbackInfo> {
+        self.fallback
+            .as_ref()
+            .map(|attribution| &attribution.fallback)
+    }
+
+    pub(crate) fn into_fallback_attribution(
+        self,
+    ) -> Option<crate::reliable::ProviderFallbackAttribution> {
+        self.fallback
+    }
+}
+
+/// Final immutable accounting projection for one dispatch-scoped call.
+#[derive(Debug, Default)]
+pub struct AccountedCallReport {
+    rejected_attempts: Vec<RejectedAttempt>,
+    accepted_route: Option<AcceptedRoute>,
+    provisional_stream_attempt: Option<RejectedAttempt>,
+}
+
+impl AccountedCallReport {
+    pub(crate) fn new(
+        rejected_attempts: Vec<RejectedAttempt>,
+        accepted_route: Option<AcceptedRoute>,
+        provisional_stream_attempt: Option<RejectedAttempt>,
+    ) -> Self {
+        Self {
+            rejected_attempts,
+            accepted_route,
+            provisional_stream_attempt,
+        }
+    }
+
+    #[must_use]
+    /// Rejected attempts, in dispatch order, for cost-only accounting.
+    pub fn rejected_attempts(&self) -> &[RejectedAttempt] {
+        &self.rejected_attempts
+    }
+
+    /// Accepted transport route, which remains provisional until runtime
+    /// semantic acceptance commits its presentation fallback.
+    #[must_use]
+    pub fn accepted_route(&self) -> Option<&AcceptedRoute> {
+        self.accepted_route.as_ref()
+    }
+
+    /// Consume and reset this scope's final report at the runtime semantic boundary.
+    ///
+    /// The contained provisional stream attempt is not rejected unless the
+    /// runtime later classifies the completed response as unacceptable.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<RejectedAttempt>,
+        Option<RejectedAttempt>,
+        Option<AcceptedRoute>,
+    ) {
+        (
+            self.rejected_attempts,
+            self.provisional_stream_attempt,
+            self.accepted_route,
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn rejected_attempt_usage(&self) -> Option<crate::traits::TokenUsage> {
+        let mut total = None;
+        for attempt in &self.rejected_attempts {
+            crate::reliable::accumulate_usage(&mut total, Some(&attempt.usage));
+        }
+        total
+    }
+}
+
+/// A successful response plus billed usage from Reliable attempts that were
+/// rejected before that response was accepted.
+///
+/// `response.usage` always describes the accepted attempt. The sidecar is for
+/// cost accounting only; it must not be used as context-window usage or
+/// successful-response telemetry.
+pub struct AccountedChatResponse {
+    pub response: ChatResponse,
+    /// Aggregate compatibility projection. Runtime accounting uses the opaque
+    /// [`AccountedChatScope`] for exact per-attempt routes.
+    pub rejected_attempt_usage: Option<crate::traits::TokenUsage>,
+}
+
+#[cfg(test)]
+pub(crate) struct AccountedChatOutcome {
+    pub(crate) result: anyhow::Result<AccountedChatResponse>,
+    pub(crate) accounting: AccountedCallReport,
+}
+
+/// Opaque, task-local accounting lifetime for the providers/runtime dispatch seam.
+///
+/// It intentionally owns no route history. Callers run one provider operation
+/// inside it and consume its one final accounting projection, including when
+/// cancellation drops that operation before it returns a result.
+#[doc(hidden)]
+pub struct AccountedChatScope {
+    inner: crate::reliable::ReliableCallAccountingScope,
+}
+
+impl AccountedChatScope {
+    /// Start the only lifecycle scope allowed by the providers/runtime
+    /// accounting contract. `Default` is intentionally not implemented: it
+    /// would add an unaudited second public construction capability.
+    #[allow(clippy::new_without_default)]
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: crate::reliable::ReliableCallAccountingScope::default(),
+        }
+    }
+
+    /// Run one provider future inside this scope's task-local collector.
+    ///
+    /// The scope owns reports independently of whether `future` completes,
+    /// times out, or is cancelled; call [`Self::take`] afterwards exactly once.
+    pub async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.inner.scope(future).await
+    }
+
+    #[must_use]
+    /// Consume the current report and reset this scope for no further reports.
+    pub fn take(&self) -> AccountedCallReport {
+        self.inner.take()
+    }
+
+    /// Finalize the currently selected stream attempt as rejected.
+    ///
+    /// Returns `false` when no provisional attempt belongs to this task-local
+    /// scope; callers must then account only their own direct-provider usage.
+    pub fn record_rejected_stream_usage(&self, usage: crate::traits::TokenUsage) -> bool {
+        crate::reliable::record_rejected_stream_usage(usage)
+    }
+
+    /// Preserve a semantic-empty stream cause across the exact-entry recovery walk.
+    pub fn mark_stream_recovery_semantic_empty(&self) {
+        crate::reliable::mark_stream_recovery_semantic_empty();
+    }
+
+    /// Clear a provisional route before an in-scope recovery replaces it.
+    ///
+    /// This has no presentation effect until [`commit_accepted_provider_route`]
+    /// runs after runtime semantic acceptance.
+    pub fn clear_provisional_provider_route(&self) {
+        crate::reliable::clear_provisional_provider_route()
+    }
+}
+
+/// Commit a semantically accepted route for the existing fallback presenter.
+///
+/// Passing `None` clears a prior candidate. Call this only after the runtime
+/// accepts the response; it mutates task-local presentation state, not billing.
+pub fn commit_accepted_provider_route(route: Option<AcceptedRoute>) {
+    crate::reliable::commit_accepted_provider_route(
+        route.and_then(AcceptedRoute::into_fallback_attribution),
+    )
+}
+
 /// Wraps a model provider so every call opens the correct
 /// `attribution_span!` automatically. See the module docs for the
 /// rationale and the CI gate that enforces routing through this type.
@@ -29,16 +267,6 @@ pub struct ProviderDispatch {
     inner: Arc<dyn ModelProvider>,
 }
 
-/// Borrowed-reference twin of [`ProviderDispatch`]. Use this at call
-/// sites that already hold a `&dyn ModelProvider` and shouldn't be
-/// forced to plumb `Arc<dyn ModelProvider>` through their signatures
-/// just to gain attribution. Same surface, same on-disk shape; the
-/// only difference is the storage discipline.
-///
-/// `stream_chat` is supported because the inner provider's
-/// `stream_chat` already returns a `BoxStream<'static, …>`; the
-/// returned stream owns its span guards (not borrowed from `self`),
-/// so the dispatcher's lifetime does not bound the stream.
 pub struct ProviderDispatchRef<'a> {
     inner: &'a dyn ModelProvider,
 }
@@ -69,12 +297,6 @@ impl ProviderDispatch {
     ) -> anyhow::Result<ChatResponse> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
-        // Enter the attribution span first so the scope! macro's
-        // info_span! constructs with the attribution span as its parent.
-        // Without this nesting, the attribution span and the scope
-        // span would be siblings (both children of the caller's span),
-        // and the layer's leaf→root walk from the scope span would
-        // skip the attribution contribution entirely.
         async move {
             zeroclaw_log::scope!(
                 model: model,
@@ -86,13 +308,24 @@ impl ProviderDispatch {
         .await
     }
 
-    /// Wrap the inner provider's `stream_chat` with
-    /// `attribution_span!` and a `scope!(model: …)`. Each `poll_next`
-    /// of the returned stream re-enters the `model_scope` span; the
-    /// attribution span is `model_scope`'s parent (set at construction
-    /// time while the attribution span was entered), so the layer's
-    /// leaf→root walk reaches the attribution contribution on every
-    /// per-chunk `record!` from inside the provider's stream body.
+    /// Like [`Self::chat`], while retaining rejected Reliable-attempt usage in
+    /// a separate accounting sidecar.
+    pub async fn chat_accounted(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let scope = AccountedChatScope::new();
+        let result = scope.scope(self.chat(request, model, temperature)).await;
+        let accounting = scope.take();
+        let rejected_attempt_usage = accounting.rejected_attempt_usage();
+        result.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
+    }
+
     pub fn stream_chat(
         &self,
         request: ChatRequest<'_>,
@@ -113,12 +346,6 @@ impl ProviderDispatch {
         );
         let inner_stream = self.inner.stream_chat(request, model, temperature, options);
         drop(_attribution_enter);
-        // Manually re-enter `model_scope` on every poll. `tracing`
-        // does not impl `Stream` for `Instrumented<S>` (only for
-        // `Future`s), so we use the `poll_fn` adapter to drive the
-        // inner stream while holding the scope guard for the duration
-        // of each poll. The guard never crosses an await — it is
-        // dropped before `poll_next` returns — so this stays `Send`.
         let mut inner_stream = inner_stream;
         stream::poll_fn(move |cx| {
             let _enter = model_scope.enter();
@@ -127,12 +354,6 @@ impl ProviderDispatch {
         .boxed()
     }
 
-    /// Wrap the inner provider's `simple_chat`. We dispatch through
-    /// `&*self.inner` because the `Arc<dyn ModelProvider>` blanket
-    /// impl does not forward `simple_chat`; routing via the blanket
-    /// would fall back to the trait default (which itself calls
-    /// `chat_with_system`), bypassing any concrete `simple_chat`
-    /// override on the inner provider.
     pub async fn simple_chat(
         &self,
         message: &str,
@@ -214,11 +435,27 @@ impl ProviderDispatch {
         .await
     }
 
-    /// Wrap the inner provider's `list_models`. No `model` parameter,
-    /// so attribution only — no `scope!(model: …)`. We dispatch
-    /// through `&*self.inner` (instead of via the `Arc<dyn …>` blanket)
-    /// because the blanket impl does not forward `list_models` and
-    /// the trait default bails with "not supported".
+    /// Like [`Self::chat_with_tools`], while retaining rejected
+    /// Reliable-attempt usage in a separate accounting sidecar.
+    pub async fn chat_with_tools_accounted(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let scope = AccountedChatScope::new();
+        let result = scope
+            .scope(self.chat_with_tools(messages, tools, model, temperature))
+            .await;
+        let accounting = scope.take();
+        let rejected_attempt_usage = accounting.rejected_attempt_usage();
+        result.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
+    }
+
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
@@ -267,12 +504,44 @@ impl<'a> ProviderDispatchRef<'a> {
         .await
     }
 
-    /// Wrap the inner provider's `stream_chat`. Same span-parenting
-    /// trick as [`ProviderDispatch::stream_chat`]; the returned
-    /// `BoxStream<'static, …>` is independent of `self`'s lifetime
-    /// because the inner provider's `stream_chat` already returns
-    /// `'static` (the spans are owned by the closure, not borrowed
-    /// from `self`).
+    /// Like [`Self::chat`], while retaining rejected Reliable-attempt usage in
+    /// a separate accounting sidecar.
+    pub async fn chat_accounted(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let scope = AccountedChatScope::new();
+        let result = scope.scope(self.chat(request, model, temperature)).await;
+        let accounting = scope.take();
+        let rejected_attempt_usage = accounting.rejected_attempt_usage();
+        result.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn chat_accounted_outcome(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> AccountedChatOutcome {
+        let scope = AccountedChatScope::new();
+        let result = scope.scope(self.chat(request, model, temperature)).await;
+        let accounting = scope.take();
+        let rejected_attempt_usage = accounting.rejected_attempt_usage();
+        AccountedChatOutcome {
+            result: result.map(|response| AccountedChatResponse {
+                response,
+                rejected_attempt_usage,
+            }),
+            accounting,
+        }
+    }
+
     pub fn stream_chat(
         &self,
         request: ChatRequest<'_>,
@@ -382,6 +651,27 @@ impl<'a> ProviderDispatchRef<'a> {
         .await
     }
 
+    /// Like [`Self::chat_with_tools`], while retaining rejected
+    /// Reliable-attempt usage in a separate accounting sidecar.
+    pub async fn chat_with_tools_accounted(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let scope = AccountedChatScope::new();
+        let result = scope
+            .scope(self.chat_with_tools(messages, tools, model, temperature))
+            .await;
+        let accounting = scope.take();
+        let rejected_attempt_usage = accounting.rejected_attempt_usage();
+        result.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
+    }
+
     /// Wrap the inner provider's `list_models`. No `model` parameter,
     /// so attribution only.
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
@@ -405,11 +695,6 @@ impl<'a> ProviderDispatchRef<'a> {
         self.inner.warmup().instrument(span).await
     }
 
-    /// Hand back the underlying borrowed provider reference. Useful
-    /// at call sites that need to forward the provider to a non-call
-    /// API (e.g. a helper that holds a `&dyn ModelProvider` for
-    /// non-attribution reasons such as a manual
-    /// `attribution_span!(provider).entered()` on a sibling event).
     #[must_use]
     pub fn inner(&self) -> &'a dyn ModelProvider {
         self.inner
@@ -566,12 +851,6 @@ mod tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
-            // Emit a record! from inside the stream body on each poll
-            // so the test can verify the span survives stream re-entry.
-            // We use `stream::iter` with eagerly-evaluated items;
-            // alternatively a manual stream could fire from inside
-            // `poll_next`. Either way the layer's scope walk must see
-            // the dispatcher-installed spans on the resulting event.
             futures_util::stream::unfold(0u8, |state| async move {
                 match state {
                     0 => {

@@ -13,11 +13,11 @@ use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::Config;
-use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl};
+use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl, CronShellOutputFormat};
 use zeroclaw_log::Instrument;
 
 const MIN_POLL_SECONDS: u64 = 5;
@@ -35,36 +35,6 @@ const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
 
-/// True when an LLM-produced output is a *quiet* `NO_REPLY` sentinel — one that
-/// means "nothing to report" — rather than content meant to be delivered.
-///
-/// Cron jobs and heartbeat tasks routinely instruct the model to answer with
-/// `NO_REPLY` when a health/status check finds nothing worth surfacing. The
-/// delivery path must recognise this sentinel and skip sending, otherwise the
-/// literal string "NO_REPLY" is announced to the channel (the bug reported in
-/// zeroclaw-labs/zeroclaw#2128).
-///
-/// # Why only the *quiet* forms are suppressed
-///
-/// The channel reply-intent classifier (see `zeroclaw-channels`
-/// `parse_reply_intent`) emits kinded forms with distinct operational meaning:
-///
-/// - `NO_REPLY` / `NO_REPLY: <reason>` / `NO_REPLY[INFO]: <reason>` — quiet,
-///   "nothing to report". **Suppressed here.**
-/// - `NO_REPLY[REFUSE]: <reason>` — refused for safety/policy/prompt-injection.
-/// - `NO_REPLY[FAIL]: <reason>` — tried but couldn't fulfil (timeout, bad URL,
-///   missing resource).
-///
-/// In the channel path a refusal or failure still surfaces out-of-band via a
-/// chat reaction (🚫 / ⚠️). Cron and heartbeat *announce* delivery have no such
-/// side channel: if we suppressed `NO_REPLY[FAIL]: database check timed out`,
-/// that operator-visible failure would silently vanish into a DEBUG log. So
-/// only the informational/legacy/bare forms are treated as suppressible here;
-/// refusal and failure kinds fall through and are delivered as visible text.
-///
-/// Matching is case-insensitive and trim-tolerant. The kinded `[...]` form is
-/// only treated as a sentinel when the kind is explicitly `INFO`; any other
-/// bracketed kind (including unknown future kinds) is conservatively delivered.
 #[must_use]
 pub fn is_no_reply_sentinel(output: &str) -> bool {
     let trimmed = output.trim();
@@ -90,14 +60,6 @@ pub fn is_no_reply_sentinel(output: &str) -> bool {
     false
 }
 
-/// The delivery decision for an announce-mode cron job or heartbeat task.
-///
-/// Separated from the I/O so the suppression behaviour can be unit-tested
-/// without a registered `DELIVERY_FN`, a live channel, or the full heartbeat
-/// worker. Both the cron announce site (`deliver_if_configured`) and the
-/// heartbeat worker route their suppression decision through
-/// [`announce_delivery_decision`], so a regression that drops the guard at
-/// either site is caught by the decision tests (zeroclaw-labs/zeroclaw#2128).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnounceDecision {
     /// Send the output to the configured channel.
@@ -115,7 +77,6 @@ impl AnnounceDecision {
 }
 
 /// Decide whether an announce-mode output should be delivered or suppressed.
-///
 /// Suppresses only the *quiet* `NO_REPLY` forms (see [`is_no_reply_sentinel`]);
 /// failure/refusal kinds and all real content are delivered.
 #[must_use]
@@ -240,8 +201,30 @@ pub async fn run_manual_job(
     context: CronDeliveryContext,
     event_tx: &EventBroadcast,
 ) -> ManualCronRunResult {
+    run_manual_job_inner(config, job, context, event_tx, None, false).await
+}
+
+pub(crate) async fn run_manual_job_with_runtime(
+    config: &Config,
+    job: &CronJob,
+    context: CronDeliveryContext,
+    event_tx: &EventBroadcast,
+    runtime: &dyn RuntimeAdapter,
+    approved: bool,
+) -> ManualCronRunResult {
+    run_manual_job_inner(config, job, context, event_tx, Some(runtime), approved).await
+}
+
+async fn run_manual_job_inner(
+    config: &Config,
+    job: &CronJob,
+    context: CronDeliveryContext,
+    event_tx: &EventBroadcast,
+    runtime: Option<&dyn RuntimeAdapter>,
+    approved: bool,
+) -> ManualCronRunResult {
     let started_at = Utc::now();
-    let (success, output) = execute_job_now(config, job).await;
+    let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
@@ -315,6 +298,7 @@ pub async fn run(
             uses_memory: true,
             session_target: None,
             delivery: None,
+            shell_output_format: CronShellOutputFormat::default(),
         };
         ::zeroclaw_log::record!(
             DEBUG,
@@ -365,12 +349,6 @@ pub async fn run(
         ),
     }
 
-    // ── Startup catch-up: run ALL overdue jobs before entering the
-    //    normal polling loop. The regular loop is capped by `max_tasks`,
-    //    which could leave some overdue jobs waiting across many cycles
-    //    if the machine was off for a while. The catch-up phase fetches
-    //    without the `max_tasks` limit so every missed job fires once.
-    //    Controlled by `[scheduler] catch_up_on_startup` (default: true).
     if config.scheduler.catch_up_on_startup {
         catch_up_overdue_jobs(&config, &event_tx).await;
     } else {
@@ -383,11 +361,6 @@ pub async fn run(
     }
 
     loop {
-        // `select!` between the interval tick and the cancellation
-        // token so the daemon's shutdown path (`channels_cancel.cancel()`
-        // at daemon/mod.rs:584) reaches the scheduler without waiting
-        // for the next tick — and so the loop returns `Ok(())` cleanly
-        // before the supervisor's `.abort()` fallback would fire.
         tokio::select! {
             _ = interval.tick() => {
                 // Keep scheduler liveness fresh even when there are no due jobs.
@@ -424,16 +397,6 @@ pub async fn run(
     }
 }
 
-/// Resolve which agent owns a given cron job. Lookup order:
-///
-/// 1. The row's persisted `agent_alias` field, when it names a
-///    configured agent.
-/// 2. Reverse-resolve via `[agents.<x>].cron_jobs` (declarative path:
-///    every alias that lists the cron alias claims ownership).
-///
-/// Returns `None` when neither resolves. Callers (process_due_jobs,
-/// execute_job_now) log and skip the job rather than crashing the
-/// scheduler loop.
 fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str> {
     if !job.agent_alias.is_empty()
         && let Some((alias, _)) = config
@@ -447,7 +410,6 @@ fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str
 }
 
 /// Fetch **all** overdue jobs (ignoring `max_tasks`) and execute them.
-///
 /// Called once at scheduler startup so that jobs missed during downtime
 /// (e.g. late boot, daemon restart) are caught up immediately.
 async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
@@ -492,14 +454,6 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
     );
 }
 
-/// Advance `next_run` for all overdue jobs without executing them.
-///
-/// Called at scheduler startup when `catch_up_on_startup` is disabled so
-/// that the normal polling loop (which selects `next_run <= now`) doesn't
-/// pick up jobs that became overdue during daemon downtime.
-///
-/// - Recurring jobs: `next_run` is advanced to the next future occurrence.
-/// - One-shot `At` jobs: disabled with a `skipped` last status.
 async fn skip_missed_jobs_on_startup(config: &Config) {
     let now = Utc::now();
     let jobs = match all_overdue_jobs(config, now) {
@@ -567,6 +521,29 @@ async fn skip_missed_jobs_on_startup(config: &Config) {
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
+    execute_job_now_with_runtime(config, job, None, false).await
+}
+
+async fn execute_job_now_with_runtime(
+    config: &Config,
+    job: &CronJob,
+    runtime: Option<&dyn RuntimeAdapter>,
+    approved: bool,
+) -> (bool, String) {
+    // Reject orphaned declarative jobs: a declarative row whose canonical
+    // config declaration has been removed must not execute through any
+    // path (automatic polling or manual trigger).
+    if job.source == "declarative" && !super::store::is_valid_declarative_owner(config, &job.id) {
+        return (
+            false,
+            format!(
+                "cron job {id:?} is an orphaned declarative entry \
+                 (source = \"declarative\" but absent from live config); \
+                 cannot execute",
+                id = job.id
+            ),
+        );
+    }
     use zeroclaw_log::Instrument;
     let Some(agent_alias) = resolve_owning_agent(config, job) else {
         return (
@@ -583,9 +560,16 @@ pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
         Err(e) => return (false, format!("agent {agent_alias} risk profile: {e}")),
     };
     let span = zeroclaw_log::attribution_span!(job);
-    Box::pin(execute_job_with_retry(config, &security, &agent_alias, job))
-        .instrument(span)
-        .await
+    Box::pin(execute_job_with_retry(
+        config,
+        &security,
+        &agent_alias,
+        job,
+        runtime,
+        approved,
+    ))
+    .instrument(span)
+    .await
 }
 
 fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
@@ -615,14 +599,34 @@ async fn execute_job_with_retry(
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
+    runtime: Option<&dyn RuntimeAdapter>,
+    approved: bool,
 ) -> (bool, String) {
+    let owned_runtime = if matches!(job.job_type, JobType::Shell) && runtime.is_none() {
+        match crate::platform::create_runtime(&config.runtime) {
+            Ok(runtime) => Some(runtime),
+            Err(error) => return (false, format!("shell setup error: {error}")),
+        }
+    } else {
+        None
+    };
+    let runtime = runtime.or(owned_runtime.as_deref());
+
     let mut last_output = String::new();
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
-            JobType::Shell => run_job_command(config, security, job).await,
+            JobType::Shell => {
+                let Some(runtime) = runtime else {
+                    return (
+                        false,
+                        "shell setup error: runtime missing for shell cron job".to_string(),
+                    );
+                };
+                run_job_command_with_runtime(config, runtime, security, job, approved).await
+            }
             JobType::Agent => Box::pin(run_agent_job(config, security, agent_alias, job)).await,
         };
         last_output = output;
@@ -646,15 +650,6 @@ async fn execute_job_with_retry(
     (false, last_output)
 }
 
-/// Atomically claim each due job, returning only the jobs this scheduler won.
-///
-/// Claiming is part of selection: a job already in flight (claimed by an earlier
-/// poll, the startup catch-up, or a concurrent trigger) is dropped here so it is
-/// never launched again while a prior run is still running (issue #6037). Each
-/// claimed job's lock is released in `execute_and_persist_job` once its run
-/// completes. Callers pass jobs sourced from `due_jobs` / `all_overdue_jobs`,
-/// which are always DB-backed, so a failed claim means the row is locked (or the
-/// claim query errored) rather than absent.
 fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<CronJob> {
     jobs.into_iter()
         .filter(|job| match claim_job(config, &job.id, Utc::now()) {
@@ -695,11 +690,6 @@ async fn process_due_jobs(
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
     let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
-        // Resolve owning agent per-job. Skip orphans with a warning so a
-        // mis-configured job can't take down the scheduler loop. The job was
-        // claimed in `claim_due_jobs`, so release the lock on every skip path
-        // here — otherwise a skipped job would stay filtered out of `due_jobs`
-        // until restart instead of being retried next poll (issue #6037).
         let Some(agent_alias) = resolve_owning_agent(config, &job) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
             let _ = release_job(config, &job.id);
@@ -764,9 +754,16 @@ async fn execute_and_persist_job(
 
     let started_at = Utc::now();
     let span = zeroclaw_log::attribution_span!(job);
-    let (success, output) = Box::pin(execute_job_with_retry(config, security, agent_alias, job))
-        .instrument(span)
-        .await;
+    let (success, output) = Box::pin(execute_job_with_retry(
+        config,
+        security,
+        agent_alias,
+        job,
+        None,
+        false,
+    ))
+    .instrument(span)
+    .await;
     let finished_at = Utc::now();
     let success = Box::pin(persist_job_result(
         config,
@@ -781,7 +778,7 @@ async fn execute_and_persist_job(
     // Release the in-flight lock claimed during selection (`claim_due_jobs`) now
     // that the run (and its reschedule/disable/delete in `persist_job_result`) is
     // done. A deleted one-shot row simply releases nothing. If this fails the lock
-    // is recovered by `clear_stale_locks` at the next startup (issue #6037).
+    // is recovered by `clear_stale_locks` at the next startup
     if let Err(e) = release_job(config, &job.id) {
         ::zeroclaw_log::record!(
             WARN,
@@ -801,11 +798,6 @@ async fn run_agent_job(
     agent_alias: &str,
     job: &CronJob,
 ) -> (bool, String) {
-    // Cron is one of two SubAgent spawn sites; the other is the
-    // agent-loop `spawn_subagent` tool. Both funnel through
-    // `SubAgentSpawn::for_agent` so permission inheritance, tracing
-    // span shape, and audit attribution stay uniform across spawn
-    // sites.
     let subagent_ctx = match crate::subagent::SubAgentSpawn::for_agent(config, agent_alias)
         .and_then(|spawn| spawn.build(crate::subagent::SubAgentOverrides::default()))
     {
@@ -836,11 +828,6 @@ async fn run_agent_job(
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
 
-    // Memory context is injected once in the engine, keyed on the Cron
-    // origin (agent::memory_inject): Conversation entries are excluded for
-    // scheduled origins, and `uses_memory = false` suppresses injection via
-    // `AgentRunOverrides.suppress_memory_inject` below. `run()` builds the
-    // same agent-scoped memory (`create_memory_for_agent`) this site used.
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
@@ -863,16 +850,6 @@ async fn run_agent_job(
         spawn_site = "cron",
     );
 
-    // Pass the validated SubAgent context as run-time overrides so the
-    // policy that came back from `SubAgentSpawn::build` reaches the
-    // agent loop. Without this the loop reconstructs from config and
-    // any future caller-supplied narrowing override would silently
-    // collapse back to the parent's verbatim policy.
-    //
-    // `is_subagent: false` is explicit (not `..Default::default()`) so
-    // a future refactor that flips the default can't quietly promote
-    // every cron-launched agent to a depth-1 subagent — they're
-    // top-level runs by design, despite riding through SubAgentSpawn.
     let run_security = cron_agent_run_security_policy(subagent_ctx.policy.as_ref(), job);
     let run_overrides = crate::agent::loop_::AgentRunOverrides {
         security: Some(Arc::new(run_security)),
@@ -884,8 +861,13 @@ async fn run_agent_job(
         // ...and makes the run memory-free end to end: the loop binds a
         // `NoneMemory` backend and drops the persistent memory tools, so a
         // `uses_memory = false` job can neither recall/store through a real
-        // backend nor reach one via advertised memory tools (issue #8695).
+        // backend nor reach one via advertised memory tools
         memory_free: !job.uses_memory,
+        // Cron runs are short-lived and one-shot — no cross-turn reuse
+        // contract, so the per-call `connect_all` path inside
+        // `agent::run` is the correct choice. The daemon heartbeat
+        // worker is the only `mcp_registry` supplier.
+        mcp_registry: None,
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -923,12 +905,6 @@ async fn run_agent_job(
         ),
         Err(e) => {
             if matches!(job.session_target, SessionTarget::Isolated) {
-                // Purge memories written during this failed run so they don't
-                // pollute future recall and cause context snowball. Routes
-                // through the cron-owning agent's per-agent memory wrapper
-                // so the purge stays scoped to the agent that wrote them.
-                // Sanitize the session key so it matches what the runtime
-                // writes via the orchestrator session-key sanitizer.
                 let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
                     "cli:{}",
                     session_path.display()
@@ -1083,11 +1059,6 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         return Ok(());
     }
 
-    // Skip delivery when the job's agent signalled "nothing to report" via the
-    // quiet NO_REPLY sentinel. Without this guard the literal sentinel string is
-    // announced to the channel (zeroclaw-labs/zeroclaw#2128). Failure/refusal
-    // kinds (`NO_REPLY[FAIL]` / `NO_REPLY[REFUSE]`) are *not* suppressed — they
-    // carry operator-visible meaning and are delivered as visible text.
     if !announce_delivery_decision(output).should_deliver() {
         ::zeroclaw_log::record!(
             DEBUG,
@@ -1170,18 +1141,6 @@ pub async fn deliver_announcement(
         )
         .await
     } else {
-        // No handler registered: this is a runtime-level state (the binary
-        // hasn't called `register_delivery_fn`), not a per-job failure.
-        // Returning `Err` here would force every announce-mode job to set
-        // `best_effort=true` just to survive a system that legitimately has
-        // no delivery wired (e.g. headless test runs, gateway-only deployments
-        // where channel orchestration lives elsewhere).
-        //
-        // We log loudly via `tracing::warn` so operators see the dropped
-        // delivery in their logs, then return `Ok(())` so `persist_job_result`
-        // records the job execution itself as successful. Operators that
-        // actively rely on delivery wire a handler at startup; absence is a
-        // configuration signal, not a delivery error.
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1194,24 +1153,30 @@ pub async fn deliver_announcement(
     }
 }
 
-async fn run_job_command(
+async fn run_job_command_with_runtime(
     config: &Config,
+    runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
     job: &CronJob,
+    approved: bool,
 ) -> (bool, String) {
-    run_job_command_with_timeout(
+    run_job_command_with_runtime_and_timeout(
         config,
+        runtime,
         security,
         job,
+        approved,
         Duration::from_secs(SHELL_JOB_TIMEOUT_SECS),
     )
     .await
 }
 
-async fn run_job_command_with_timeout(
+async fn run_job_command_with_runtime_and_timeout(
     config: &Config,
+    runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
     job: &CronJob,
+    approved: bool,
     timeout: Duration,
 ) -> (bool, String) {
     if !security.can_act() {
@@ -1232,9 +1197,8 @@ async fn run_job_command_with_timeout(
     // Jobs created via the validated helpers were already checked at creation
     // time, but we re-validate at execution time to catch policy changes and
     // manually-edited job stores.
-    let approved = false; // scheduler runs are never pre-approved
     if let Err(error) =
-        crate::cron::validate_shell_command_with_security(security, &job.command, approved)
+        crate::cron::validate_shell_command_with_security(runtime, security, &job.command, approved)
     {
         return (false, error.to_string());
     }
@@ -1253,24 +1217,49 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    let child = match build_cron_shell_command(&job.command, &config.data_dir) {
-        Ok(mut cmd) => match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => return (false, format!("spawn error: {e}")),
-        },
-        Err(e) => return (false, format!("shell setup error: {e}")),
+    // `job.shell_output_format` is already the canonical value by the time
+    // it reaches here: due_jobs()/all_overdue_jobs() resolve declarative jobs
+    // from config and leave imperative jobs on their stored field (see
+    // resolve_declarative_shell_output_format in store.rs). Re-deriving it
+    // here from `config.cron.get(&job.id)` without checking `job.source`
+    // would let an unrelated same-ID declarative config entry silently
+    // override an imperative job's stored format.
+    let output_format = &job.shell_output_format;
+
+    let mut command = match runtime.build_shell_command(&job.command, &config.data_dir) {
+        Ok(command) => command,
+        Err(error) => return (false, format!("shell setup error: {error}")),
+    };
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return (false, format!("spawn error: {error}")),
     };
 
     match time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let combined = format!(
-                "status={}\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                stdout.trim(),
-                stderr.trim()
-            );
+            let combined = match output_format {
+                // Raw mode on success returns bare stdout, by design — the
+                // point is to hand back exactly what a direct shell run
+                // would print on stdout, with no wrapper. stderr on a
+                // successful exit is intentionally dropped, not lost by
+                // accident; a failing exit still gets the full wrapped
+                // status/stdout/stderr envelope below for diagnosis.
+                CronShellOutputFormat::Raw if output.status.success() => stdout.trim().to_string(),
+                _ => format!(
+                    "status={}\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    stdout.trim(),
+                    stderr.trim()
+                ),
+            };
             (output.status.success(), combined)
         }
         Ok(Err(e)) => (false, format!("spawn error: {e}")),
@@ -1281,33 +1270,39 @@ async fn run_job_command_with_timeout(
     }
 }
 
-/// Build a shell `Command` for cron job execution.
-///
-/// Uses `sh -c <command>` (non-login shell). On Windows, ZeroClaw users
-/// typically have Git Bash installed which provides `sh` in PATH, and
-/// cron commands are written with Unix shell syntax. The previous `-lc`
-/// (login shell) flag was dropped: login shells load the full user
-/// profile on every invocation which is slow and may cause side effects.
-///
-/// The command is configured with:
-/// - `current_dir` set to the workspace
-/// - `stdin` piped to `/dev/null` (no interactive input)
-/// - `stdout` and `stderr` piped for capture
-/// - `kill_on_drop(true)` for safe timeout handling
-fn build_cron_shell_command(
-    command: &str,
-    workspace_dir: &std::path::Path,
-) -> anyhow::Result<Command> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(workspace_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+#[cfg(test)]
+async fn run_job_command(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+) -> (bool, String) {
+    let runtime = match crate::platform::create_runtime(&config.runtime) {
+        Ok(runtime) => runtime,
+        Err(error) => return (false, format!("shell setup error: {error}")),
+    };
+    run_job_command_with_runtime(config, runtime.as_ref(), security, job, false).await
+}
 
-    Ok(cmd)
+#[cfg(all(test, not(target_os = "windows")))]
+async fn run_job_command_with_timeout(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    timeout: Duration,
+) -> (bool, String) {
+    let runtime = match crate::platform::create_runtime(&config.runtime) {
+        Ok(runtime) => runtime,
+        Err(error) => return (false, format!("shell setup error: {error}")),
+    };
+    run_job_command_with_runtime_and_timeout(
+        config,
+        runtime.as_ref(),
+        security,
+        job,
+        false,
+        timeout,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1317,9 +1312,18 @@ mod tests {
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
     use tempfile::TempDir;
-    use zeroclaw_config::schema::Config;
+    use zeroclaw_config::schema::{Config, RuntimeKind};
 
     const TEST_AGENT: &str = "test-agent";
+
+    fn build_configured_shell_command(
+        config: &Config,
+        command: &str,
+        workspace_dir: &std::path::Path,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let runtime = crate::platform::create_runtime(&config.runtime)?;
+        runtime.build_shell_command(command, workspace_dir)
+    }
 
     #[test]
     fn is_no_reply_sentinel_matches_bare_form_case_insensitively() {
@@ -1348,7 +1352,7 @@ mod tests {
         // REFUSE / FAIL carry operator-visible meaning. In the cron/heartbeat
         // announce context there is no reaction side-channel, so suppressing
         // them would silently drop a failure/refusal the operator must see
-        // (zeroclaw-labs/zeroclaw#2128 review feedback).
+        // review feedback).
         assert!(!is_no_reply_sentinel(
             "NO_REPLY[FAIL]: database check timed out"
         ));
@@ -1431,12 +1435,112 @@ mod tests {
             allowed_tools: None,
             uses_memory: true,
             source: "imperative".into(),
+            shell_output_format: CronShellOutputFormat::default(),
             created_at: Utc::now(),
             next_run: Utc::now(),
             last_run: None,
             last_status: None,
             last_output: None,
         }
+    }
+
+    struct PowerShellProbeRuntime {
+        build_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PowerShellProbeRuntime {
+        fn new() -> Self {
+            Self {
+                build_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl RuntimeAdapter for PowerShellProbeRuntime {
+        fn name(&self) -> &str {
+            "powershell-probe"
+        }
+
+        fn has_filesystem_access(&self) -> bool {
+            true
+        }
+
+        fn storage_path(&self) -> std::path::PathBuf {
+            std::env::temp_dir()
+        }
+
+        fn supports_long_running(&self) -> bool {
+            true
+        }
+
+        fn shell_dialect(&self) -> zeroclaw_api::runtime_traits::ShellDialect {
+            zeroclaw_api::runtime_traits::ShellDialect::PowerShell
+        }
+
+        fn build_shell_command(
+            &self,
+            _command: &str,
+            workspace_dir: &std::path::Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            self.build_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            #[cfg(target_os = "windows")]
+            let mut command = {
+                let mut command = tokio::process::Command::new("cmd");
+                command.args(["/C", "echo", "same-runtime"]);
+                command
+            };
+
+            #[cfg(not(target_os = "windows"))]
+            let mut command = {
+                let mut command = tokio::process::Command::new("printf");
+                command.arg("same-runtime");
+                command
+            };
+
+            command.current_dir(workspace_dir);
+            Ok(command)
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_shell_validation_and_execution_share_runtime_adapter() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy {
+            autonomy: zeroclaw_config::policy::AutonomyLevel::Full,
+            workspace_dir: config.data_dir.clone(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        let runtime = PowerShellProbeRuntime::new();
+
+        let safe_job = test_job("Write-Output \"quoted safe value\" | Select-Object -First 1");
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &safe_job, false).await;
+        assert!(success, "{output}");
+        assert!(output.contains("same-runtime"), "{output}");
+        assert_eq!(
+            runtime
+                .build_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let dangerous_job = test_job("ac blocked.txt value");
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &dangerous_job, true).await;
+        assert!(!success);
+        assert!(output.contains("high-risk"), "{output}");
+        assert_eq!(
+            runtime
+                .build_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "policy rejection must happen before the runtime builds a command"
+        );
     }
 
     fn unique_component(prefix: &str) -> String {
@@ -1578,6 +1682,92 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_raw_output_success() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        // The store layer resolves shell_output_format before handing the job
+        // to the scheduler (see resolve_declarative_shell_output_format), so
+        // the job's own field is already canonical by the time it gets here.
+        let mut job = test_job("echo raw-format-ok");
+        job.shell_output_format = CronShellOutputFormat::Raw;
+        let security = test_security(&config);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        // Raw output should be just the command's trimmed stdout, no wrapper.
+        assert_eq!(output, "raw-format-ok");
+        assert!(!output.contains("status="));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_raw_output_success_drops_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        // A zero-exit command that still writes to stderr (e.g. a tool's
+        // progress/warning chatter) must not leak into raw-mode output.
+        let mut job = test_job("echo raw-stdout-ok; echo raw-stderr-noise >&2");
+        job.shell_output_format = CronShellOutputFormat::Raw;
+        let security = test_security(&config);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        // Dropping stderr on a successful exit is intentional design, not
+        // an oversight — see the comment at the call site.
+        assert_eq!(output, "raw-stdout-ok");
+        assert!(!output.contains("raw-stderr-noise"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_raw_output_failure_still_uses_wrapped() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("ls definitely_missing_file_raw_test");
+        job.shell_output_format = CronShellOutputFormat::Raw;
+        let security = test_security(&config);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(!success);
+        // On failure, raw mode should still include the wrapped format
+        // so operators can diagnose the failure.
+        assert!(output.contains("status=exit status:"));
+        assert!(output.contains("definitely_missing_file_raw_test"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_imperative_job_ignores_same_id_declarative_config_entry() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        // An unrelated declarative config entry happens to share the
+        // imperative job's ID and asks for raw output. Execution must go by
+        // the job's own (already-resolved) field, not re-derive from config
+        // by ID match, or the imperative job's stored format gets silently
+        // overridden.
+        config.cron.insert(
+            "test-job".into(),
+            zeroclaw_config::schema::CronJobDecl {
+                command: Some("echo collision-ok".into()),
+                shell_output_format: CronShellOutputFormat::Raw,
+                ..Default::default()
+            },
+        );
+        let mut job = test_job("echo collision-ok");
+        job.source = "imperative".into();
+        job.shell_output_format = CronShellOutputFormat::Wrapped;
+        let security = test_security(&config);
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+        assert!(success);
+        assert!(
+            output.contains("status="),
+            "imperative job's own Wrapped format must win over a same-ID declarative config entry: {output}"
+        );
+    }
+
+    #[tokio::test]
     async fn run_manual_job_persists_history_and_broadcasts() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1713,6 +1903,82 @@ mod tests {
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
         assert!(output.contains(outside_path));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_windows_relative_path_for_powershell() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["cat".into()];
+        let job = test_job("cat ..\\secret.txt");
+        let security = test_security(&config);
+        let runtime = crate::platform::NativeRuntime::with_shell("pwsh".into());
+
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
+
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("forbidden path argument"));
+        assert!(output.contains("..\\secret.txt"));
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_powershell_stop_parsing_native_mutation() {
+        // Cron shares the same dialect-aware validator as the shell tool. On a
+        // PowerShell runtime, `git --% push` would strip `--%` and hand `push`
+        // to native Git while policy only sees `--%`; the bounded grammar must
+        // reject it so scheduled jobs cannot launder mutations through it.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["git".into()];
+        let job = test_job("git --% push origin main");
+        let security = test_security(&config);
+        let runtime = crate::platform::NativeRuntime::with_shell("pwsh".into());
+
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
+
+        assert!(!success);
+        assert!(
+            output.contains("blocked by security policy"),
+            "output: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_job_command_blocks_powershell_mixed_quoted_provider_path() {
+        // A scheduled job must not launder an `Env:` provider read past policy
+        // by splitting the provider prefix with a quote: `cat E'nv:'PATH` binds
+        // as `Env:PATH` on PowerShell. The bounded grammar rejects the mixed
+        // quoted/unquoted token through the same validator cron uses.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["cat".into()];
+        let job = test_job("cat E'nv:'PATH");
+        let security = test_security(&config);
+        let runtime = crate::platform::NativeRuntime::with_shell("pwsh".into());
+
+        let (success, output) =
+            run_job_command_with_runtime(&config, &runtime, &security, &job, false).await;
+
+        assert!(!success);
+        assert!(
+            output.contains("blocked by security policy"),
+            "output: {output}"
+        );
     }
 
     #[tokio::test]
@@ -1867,6 +2133,8 @@ mod tests {
             &security,
             "test-agent",
             &job,
+            None,
+            false,
         ))
         .await;
         assert!(success);
@@ -1889,6 +2157,8 @@ mod tests {
             &security,
             "test-agent",
             &job,
+            None,
+            false,
         ))
         .await;
         assert!(!success);
@@ -2224,7 +2494,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell").unwrap();
+        let job =
+            cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell", None).unwrap();
         assert!(job.delete_after_run);
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -2256,7 +2527,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell").unwrap();
+        let job =
+            cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell", None).unwrap();
         assert!(job.delete_after_run);
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -2272,7 +2544,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
-        let job = cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell").unwrap();
+        let job =
+            cron::add_once_at(&config, "test-agent", at, "echo one-shot-shell", None).unwrap();
         assert!(job.delete_after_run);
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -2437,14 +2710,6 @@ mod tests {
         assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
     }
 
-    /// Process-global recorder for the injected delivery fn. `deliver_announcement`
-    /// reads a single `OnceLock`-backed handler, so the whole test binary shares
-    /// one handler regardless of registration order. This recorder is a superset
-    /// of the failure-contract handler the delivery-classification tests rely on:
-    /// it fails for `channel == "fail-delivery"`, counts deliveries on the
-    /// dedicated `count-delivery` channel, and otherwise just succeeds. Counting
-    /// only the dedicated channel keeps the suppression test's count deltas
-    /// immune to deliveries from other tests running in parallel.
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// Channel name the recorder counts. Used only by the suppression test.
@@ -2480,11 +2745,6 @@ mod tests {
         job
     }
 
-    /// Regression for zeroclaw-labs/zeroclaw#2128: the cron announce delivery
-    /// path must NOT call the channel delivery fn for a quiet `NO_REPLY`
-    /// sentinel, but MUST call it for real content and for failure/refusal
-    /// kinds. This exercises `deliver_if_configured` end-to-end, so it fails if
-    /// the suppression guard is removed from that call site.
     #[tokio::test]
     async fn deliver_if_configured_suppresses_no_reply_but_delivers_real_and_failure() {
         register_recording_delivery_fn();
@@ -2534,11 +2794,6 @@ mod tests {
         }
     }
 
-    /// Mirrors the heartbeat worker's suppression decision (daemon/mod.rs).
-    /// The worker computes `suppress_delivery` from `announce_delivery_decision`,
-    /// so this locks the two user-visible heartbeat behaviors from #2128:
-    /// a `NO_REPLY` heartbeat sends nothing, while real output (and the
-    /// empty-output `💓 heartbeat task completed` fallback) still deliver.
     #[test]
     fn heartbeat_announce_decision_matches_worker_behavior() {
         // NO_REPLY heartbeat: suppressed.
@@ -2570,9 +2825,11 @@ mod tests {
     }
 
     #[test]
-    fn build_cron_shell_command_uses_sh_non_login() {
+    #[cfg(not(target_os = "windows"))]
+    fn build_cron_shell_command_uses_configured_runtime() {
+        let config = Config::default();
         let workspace = std::env::temp_dir();
-        let cmd = build_cron_shell_command("echo cron-test", &workspace).unwrap();
+        let cmd = build_configured_shell_command(&config, "echo cron-test", &workspace).unwrap();
         let debug = format!("{cmd:?}");
         assert!(debug.contains("echo cron-test"));
         assert!(debug.contains("\"sh\""), "should use sh: {debug}");
@@ -2585,13 +2842,105 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn build_cron_shell_command_executes_successfully() {
+        let config = Config::default();
         let workspace = std::env::temp_dir();
-        let mut cmd = build_cron_shell_command("echo cron-ok", &workspace).unwrap();
+        let mut cmd = build_configured_shell_command(&config, "echo cron-ok", &workspace).unwrap();
         let output = cmd.output().await.unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("cron-ok"));
+    }
+
+    #[tokio::test]
+    #[cfg(all(unix, not(target_os = "android")))]
+    async fn build_cron_shell_command_executes_with_custom_native_shell() {
+        let tmp = TempDir::new().unwrap();
+        let shim = tmp.path().join("cron-shell-shim");
+        // Avoid writing an executable after the test process is multithreaded:
+        // a concurrently forked child can inherit the write descriptor and
+        // make the subsequent exec fail with ETXTBSY.
+        let shell = which::which("sh").unwrap();
+        std::os::unix::fs::symlink(shell, &shim).unwrap();
+
+        let mut config = Config::default();
+        config.runtime.shell = Some(shim.to_string_lossy().into_owned());
+        let mut cmd = build_configured_shell_command(
+            &config,
+            "printf 'CUSTOM_SHELL:%s\\n' \"$0\"",
+            tmp.path(),
+        )
+        .unwrap();
+        let output = cmd.output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(output.status.success());
+        assert_eq!(stdout.trim(), format!("CUSTOM_SHELL:{}", shim.display()));
+    }
+
+    #[test]
+    fn build_cron_shell_command_preserves_docker_runtime_boundary() {
+        let mut config = Config::default();
+        config.runtime.kind = RuntimeKind::Docker;
+        config.runtime.docker.image = "alpine:3.20".into();
+        config.runtime.docker.network = "none".into();
+        config.runtime.docker.mount_workspace = false;
+
+        let cmd =
+            build_configured_shell_command(&config, "echo cron-docker", &std::env::temp_dir())
+                .unwrap();
+        let debug = format!("{cmd:?}");
+
+        assert!(debug.contains("\"docker\""), "{debug}");
+        assert!(debug.contains("\"run\""), "{debug}");
+        assert!(debug.contains("\"--network\""), "{debug}");
+        assert!(debug.contains("\"none\""), "{debug}");
+        assert!(debug.contains("\"alpine:3.20\""), "{debug}");
+        assert!(
+            debug.contains("\"sh\" \"-c\" \"echo cron-docker\""),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn build_cron_shell_command_uses_configured_powershell() {
+        let mut config = Config::default();
+        config.runtime.shell = Some("powershell".into());
+        let workspace = std::env::temp_dir();
+        let cmd =
+            build_configured_shell_command(&config, "Write-Output cron-ok", &workspace).unwrap();
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("powershell"));
+        assert!(debug.contains("-Command"));
+        assert!(!debug.contains("cmd.exe"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn cron_powershell_policy_accepts_read_only_and_rejects_expressions() {
+        let mut config = Config::default();
+        config.runtime.shell = Some("powershell".into());
+        let security = SecurityPolicy::default();
+        let runtime = crate::platform::create_runtime(&config.runtime).unwrap();
+
+        crate::cron::validate_shell_command_with_security(
+            runtime.as_ref(),
+            &security,
+            "Write-Output $PSHOME",
+            false,
+        )
+        .expect("documented read-only PowerShell command should pass");
+        assert!(
+            crate::cron::validate_shell_command_with_security(
+                runtime.as_ref(),
+                &security,
+                "echo ([System.IO.File]::Delete('important.txt'))",
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2680,7 +3029,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_due_jobs_skips_in_flight_job() {
-        // Regression for #6037: once a due job is claimed for execution, a
+        // once a due job is claimed for execution, a
         // subsequent selection pass must not pick it up again until the prior
         // run releases it — otherwise a job that runs longer than the poll
         // interval is launched repeatedly.
@@ -2711,7 +3060,7 @@ mod tests {
         // A job claimed for execution but then skipped by process_due_jobs (here
         // an orphan with no owning agent) must have its in-flight lock released,
         // so it is retried on the next poll instead of being wedged out of
-        // due_jobs until restart (issue #6037).
+        // due_jobs until restart
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         // Insert a real, claimable DB row under a configured agent, then drive

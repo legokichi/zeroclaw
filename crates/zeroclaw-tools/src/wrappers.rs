@@ -1,26 +1,4 @@
 //! Generic tool wrappers for crosscutting concerns.
-//!
-//! Each wrapper implements [`Tool`] by delegating to an inner tool while
-//! applying one crosscutting concern around the `execute` call.  Wrappers
-//! compose: stack them at construction time in `tools/mod.rs` rather than
-//! repeating the same guard blocks inside every tool's `execute` method.
-//!
-//! # Composition order (outermost first)
-//!
-//! ```text
-//! RateLimitedTool
-//!   └─ PathGuardedTool
-//!        └─ <concrete tool>
-//! ```
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! let tool = RateLimitedTool::new(
-//!     PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
-//!     security.clone(),
-//! );
-//! ```
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -33,31 +11,6 @@ type PathExtractor = dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync;
 
 // ── RateLimitedTool ───────────────────────────────────────────────────────────
 
-/// Wraps any [`Tool`] and enforces the [`SecurityPolicy`] rate limit.
-///
-/// Replaces the repeated `is_rate_limited()` / `record_action()` guard blocks
-/// previously inlined in every tool's `execute` method (~30 files, ~50 call
-/// sites).
-///
-/// # Budget semantics
-///
-/// `record_action()` runs **after** the inner tool returns and only when
-/// `ToolResult.success == true`.  This matches the pre-wrapper behaviour: only
-/// calls that actually performed work consumed the action budget.  Validation,
-/// policy, path-allowlist, read-only, and command-validation failures all
-/// surface as `success: false` from the inner tool (or inner wrapper) and do
-/// not consume a slot.
-///
-/// ## Read-tool exception (anti-probing)
-///
-/// `FileReadTool` (`zeroclaw-runtime::tools::file_read`) in this crate
-/// intentionally calls `record_action()` *itself* on the post-`PathGuardedTool`
-/// `resolve_candidate` / `canonicalize` failure paths.
-/// This prevents an attacker from probing path existence for free: each
-/// attempt — successful or failed — consumes exactly one slot.  The outer
-/// `RateLimitedTool` only records on `success: true`, so the totals stay at
-/// one slot per attempt.  When introducing a new read-style tool, follow the
-/// same pattern.
 pub struct RateLimitedTool<T: Tool> {
     inner: T,
     security: Arc<SecurityPolicy>,
@@ -101,27 +54,21 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        let reservation = match self.security.reserve_action() {
+            Some(reservation) => reservation,
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                });
+            }
+        };
 
-        // Delegate first; only record against the budget when the inner tool
-        // actually performed work (ToolResult.success == true).  This preserves
-        // the pre-wrapper semantics where validation/policy failures (forbidden
-        // paths, malformed args, disabled config, read-only blocks, command
-        // validation) did not consume the action budget.
         let result = self.inner.execute(args).await?;
 
-        if result.success && !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
+        if result.success {
+            reservation.commit();
         }
 
         Ok(result)
@@ -130,16 +77,6 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
 
 // ── PathGuardedTool ───────────────────────────────────────────────────────────
 
-/// Wraps any [`Tool`] and blocks calls whose arguments contain a forbidden path.
-///
-/// Replaces the `forbidden_path_argument()` guard blocks previously inlined in
-/// tools that accept a path-like argument (`shell`, `file_read`, `file_write`,
-/// `file_edit`, `content_search`, `glob_search`, `image_info`).
-///
-/// Path extraction is argument-name-driven: the wrapper inspects the `"path"`,
-/// `"command"`, `"pattern"`, and `"query"` fields of the JSON argument object.
-/// Tools whose path argument uses a different field name can pass a custom
-/// extractor at construction via [`PathGuardedTool::with_extractor`].
 pub struct PathGuardedTool<T: Tool> {
     inner: T,
     security: Arc<SecurityPolicy>,
@@ -218,7 +155,7 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
             let blocked = if self.extractor.is_none()
                 && args.get("command").and_then(|v| v.as_str()).is_some()
             {
-                self.security.forbidden_path_argument(&arg)
+                self.security.forbidden_workspace_path_argument(&arg)
             } else if !self.security.is_path_allowed(&arg) {
                 Some(arg.clone())
             } else {
@@ -245,6 +182,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -353,6 +291,66 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
+    struct BlockingTool {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(BlockingTool);
+
+    #[async_trait]
+    impl Tool for BlockingTool {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+        fn description(&self) -> &str {
+            "waits until released"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limited_parallel_calls_cannot_overbook_one_slot() {
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let first = RateLimitedTool::new(
+            BlockingTool {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+            sec.clone(),
+        );
+        let first_call =
+            zeroclaw_spawn::spawn!(async move { first.execute(serde_json::json!({})).await });
+        entered.notified().await;
+
+        let (second_inner, second_calls) = CountingTool::new();
+        let second = RateLimitedTool::new(second_inner, sec);
+        let blocked = second.execute(serde_json::json!({})).await.unwrap();
+        assert!(!blocked.success, "the in-flight call owns the only slot");
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+
+        release.notify_one();
+        assert!(first_call.await.unwrap().unwrap().success);
+    }
+
     // ── PathGuardedTool tests ─────────────────────────────────────────────────
 
     #[tokio::test]
@@ -437,8 +435,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limited_does_not_consume_budget_on_failure() {
         // Inner tool that always reports failure (e.g. validation error).
-        // record_action() must NOT fire, so the budget stays at full and
-        // a subsequent successful call still goes through.
+        // Its reservation must be released so a later successful call can run.
         struct AlwaysFails;
         impl ::zeroclaw_api::attribution::Attributable for AlwaysFails {
             fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -492,6 +489,124 @@ mod tests {
         let r = succeeding.execute(serde_json::json!({})).await.unwrap();
         assert!(r.success);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_releases_budget_on_inner_error() {
+        struct AlwaysErrors;
+        zeroclaw_api::mock_tool_attribution!(AlwaysErrors);
+
+        #[async_trait]
+        impl Tool for AlwaysErrors {
+            fn name(&self) -> &str {
+                "always_errors"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                anyhow::bail!("inner error")
+            }
+        }
+
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let erroring = RateLimitedTool::new(AlwaysErrors, sec.clone());
+        assert!(erroring.execute(serde_json::json!({})).await.is_err());
+
+        let (inner, calls) = CountingTool::new();
+        let succeeding = RateLimitedTool::new(inner, sec);
+        assert!(
+            succeeding
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_releases_budget_when_call_is_cancelled() {
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let entered = Arc::new(Notify::new());
+        let tool = RateLimitedTool::new(
+            BlockingTool {
+                entered: entered.clone(),
+                release: Arc::new(Notify::new()),
+            },
+            sec.clone(),
+        );
+        let call = zeroclaw_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
+        entered.notified().await;
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+
+        let (inner, calls) = CountingTool::new();
+        let succeeding = RateLimitedTool::new(inner, sec);
+        assert!(
+            succeeding
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_releases_budget_when_inner_panics() {
+        struct PanickingTool;
+        zeroclaw_api::mock_tool_attribution!(PanickingTool);
+
+        #[async_trait]
+        impl Tool for PanickingTool {
+            fn name(&self) -> &str {
+                "panicking"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                panic!("inner panic")
+            }
+        }
+
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let tool = RateLimitedTool::new(PanickingTool, sec.clone());
+        let call = zeroclaw_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
+        assert!(call.await.unwrap_err().is_panic());
+
+        let (inner, calls) = CountingTool::new();
+        let succeeding = RateLimitedTool::new(inner, sec);
+        assert!(
+            succeeding
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

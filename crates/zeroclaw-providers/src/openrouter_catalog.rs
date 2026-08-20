@@ -1,11 +1,4 @@
 //! Cross-vendor model catalog via OpenRouter's public `/api/v1/models` endpoint.
-//!
-//! Fallback for compat providers that don't have a `models.dev` entry and
-//! can't reach their native `/models` endpoint without a credential. Each
-//! OpenRouter model id is `<vendor>/<slug>`; we filter by vendor prefix
-//! (e.g. `x-ai/` for xAI, `tencent/` for Hunyuan) and return the slug list.
-//!
-//! Cached once per process (`OnceCell`) and shared across all callers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +8,6 @@ use serde::Deserialize;
 use tokio::sync::OnceCell;
 use zeroclaw_api::model_provider::ModelPricing;
 
-const CATALOG_URL: &str = "https://openrouter.ai/api/v1/models";
 const FETCH_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Deserialize)]
@@ -46,7 +38,11 @@ async fn fetch_catalog() -> Result<Arc<Vec<String>>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()?;
-    let response = client.get(CATALOG_URL).send().await?.error_for_status()?;
+    let response = client
+        .get(crate::openrouter::endpoint_url("models"))
+        .send()
+        .await?
+        .error_for_status()?;
     let bytes = response.bytes().await?;
     Ok(Arc::new(parse_catalog(&bytes)?))
 }
@@ -55,7 +51,11 @@ async fn fetch_catalog_with_pricing() -> Result<Arc<Vec<ModelEntryWithPricing>>>
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()?;
-    let response = client.get(CATALOG_URL).send().await?.error_for_status()?;
+    let response = client
+        .get(crate::openrouter::endpoint_url("models"))
+        .send()
+        .await?
+        .error_for_status()?;
     let bytes = response.bytes().await?;
     Ok(Arc::new(parse_catalog_with_pricing(&bytes)?))
 }
@@ -112,6 +112,9 @@ fn filter_by_vendor_with_pricing(
             e.id.strip_prefix(&needle).map(|slug| ModelInfo {
                 id: slug.to_string(),
                 pricing: e.pricing.clone(),
+                // OpenRouter publishes `context_length`; wiring it is a
+                // follow-up. `None` means "unknown", never a stub value.
+                context_window: None,
             })
         })
         .collect();
@@ -143,11 +146,6 @@ pub async fn list_models_for_vendor_with_pricing(
     filter_by_vendor_with_pricing(catalog, vendor_prefix)
 }
 
-/// Map an enriched catalog into `ModelInfo` entries, preserving the full
-/// `<vendor>/<slug>` id (no prefix stripping). Sorted and deduped by id. Pure —
-/// separated from the live fetch so it can be unit-tested. Used by the
-/// first-class `openrouter` provider, which lists the entire catalog rather
-/// than a single vendor's slice.
 fn all_models_with_pricing(
     catalog: &[ModelEntryWithPricing],
 ) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
@@ -157,6 +155,9 @@ fn all_models_with_pricing(
         .map(|e| ModelInfo {
             id: e.id.clone(),
             pricing: e.pricing.clone(),
+            // OpenRouter publishes `context_length`; wiring it is a follow-up.
+            // `None` means "unknown", never a stub value.
+            context_window: None,
         })
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));

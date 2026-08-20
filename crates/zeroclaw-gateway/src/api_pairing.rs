@@ -2,7 +2,7 @@
 
 use super::AppState;
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// Metadata about a paired device.
@@ -36,17 +37,6 @@ pub struct DeviceRegistry {
 }
 
 impl DeviceRegistry {
-    /// Construct a registry and warm its in-memory cache from the SQLite
-    /// database at `<workspace_dir>/devices.db`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the device registry database cannot be opened or initialised.
-    /// This is intentional startup-path behaviour: a gateway that cannot reach
-    /// its device registry at boot must not come up at all, since later
-    /// per-request errors would only surface after devices begin trying to
-    /// pair. Callers that prefer graceful degradation should wrap construction
-    /// in `catch_unwind` or call out of `main` before any HTTP server starts.
     pub fn new(workspace_dir: &Path) -> Self {
         let db_path = workspace_dir.join("devices.db");
         let conn = Connection::open(&db_path).expect("Failed to open device registry database");
@@ -119,14 +109,6 @@ impl DeviceRegistry {
         }
     }
 
-    /// Construct a registry directly from a database path with an empty
-    /// in-memory cache, bypassing the workspace-relative join and the
-    /// initial schema/cache warm-up.
-    ///
-    /// Intended only for tests that need to inject an unusable path
-    /// (e.g. a non-existent directory or read-only location) to force
-    /// `register` / `revoke` / `list` to surface a `rusqlite::Error`
-    /// without polluting the workspace.
     #[cfg(test)]
     pub(crate) fn with_db_path(db_path: PathBuf) -> Self {
         Self {
@@ -168,22 +150,6 @@ impl DeviceRegistry {
         Ok(())
     }
 
-    /// Backfill placeholder rows for paired tokens that have no device entry.
-    ///
-    /// Bearer tokens paired through the legacy `/pair` route (`handle_pair`)
-    /// historically never called [`register`](Self::register), so their hashes
-    /// live in `gateway.paired_tokens` — the canonical credential set the auth
-    /// gate checks — with no matching device row. Such tokens fully
-    /// authenticate yet are invisible in `GET /api/devices` and cannot be
-    /// revoked from the management UI, which is a security-management gap.
-    ///
-    /// This reconciles the registry (metadata, keyed by `token_hash`) against
-    /// that canonical set on startup: every hash without a row gets a neutral
-    /// `"legacy"` placeholder so it surfaces and can be revoked like any other
-    /// device. The source of truth for *which* tokens are valid remains
-    /// `PairingGuard`/`gateway.paired_tokens` — this never invents a token,
-    /// only surfaces ones that already authenticate. `INSERT OR IGNORE` keeps a
-    /// real row from being clobbered. Returns the number of rows inserted.
     pub fn reconcile_from_token_hashes(
         &self,
         token_hashes: &[String],
@@ -262,14 +228,6 @@ impl DeviceRegistry {
         rows.collect()
     }
 
-    /// Delete a device by id and return its SHA-256 token hash so the caller
-    /// can revoke the matching bearer token.
-    ///
-    /// `Ok(None)` means the device did not exist; real SQLite errors are
-    /// propagated so handlers can distinguish "nothing to do" from "DB is
-    /// broken" — confusing the two during incident response is dangerous.
-    /// Uses `DELETE … RETURNING` (SQLite ≥ 3.35) so the read and delete are
-    /// atomic under concurrent revoke calls.
     pub fn revoke(&self, device_id: &str) -> Result<Option<String>, rusqlite::Error> {
         let conn = self.open_db()?;
         let deleted: Option<String> = conn
@@ -317,12 +275,6 @@ impl DeviceRegistry {
         }
     }
 
-    /// Replace the capability list for the device identified by `token_hash`.
-    /// Returns true if a row was updated. A database error during the write
-    /// is reported as "no row updated" rather than propagated — the row may
-    /// legitimately not exist (token was revoked between bearer issuance and
-    /// capability push), and conflating that with "DB is broken" misleads the
-    /// operator during incident response.
     pub fn update_capabilities(&self, token_hash: &str, capabilities: Vec<String>) -> bool {
         let json = serde_json::to_string(&capabilities).unwrap_or_else(|_| "[]".into());
         let conn = match self.open_db() {
@@ -419,6 +371,7 @@ pub async fn initiate_pairing(
 /// POST /api/pair — submit pairing code (for new device pairing)
 pub async fn submit_pairing_enhanced(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -426,23 +379,42 @@ pub async fn submit_pairing_enhanced(
     let device_name = body["device_name"].as_str().map(String::from);
     let device_type = body["device_type"].as_str().map(String::from);
 
-    let client_id = headers
-        .get("X-Forwarded-For")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+    // Derive the brute-force lockout key from the real connection peer, only trusting
+    // forwarded headers behind a configured proxy. Reading it straight from
+    // `X-Forwarded-For` let an unauthenticated client vary the header to dodge the
+    // per-client lockout entirely. Mirrors the legacy `/pair` handler.
+    let client_id =
+        super::client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+
+    // Brute-force protection, mirroring the legacy `/pair` handler: a coarse
+    // per-key request cap plus the shared auth rate limiter. Both are keyed on
+    // the connection-derived client id (not a spoofable header), so this handler
+    // cannot bypass rate limiting by rotating untrusted forwarding headers.
+    if !state.rate_limiter.allow_pair(&client_id) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "paired": false,
+                "error": "Too many pairing requests. Please retry later.",
+                "retry_after": super::RATE_LIMIT_WINDOW_SECS,
+            })),
+        )
+            .into_response();
+    }
+    if let Err(e) = state.auth_limiter.check_rate_limit(&client_id) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "paired": false,
+                "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
+                "retry_after": e.retry_after_secs,
+            })),
+        )
+            .into_response();
+    }
 
     match state.pairing.try_pair(code, &client_id).await {
         Ok(Some(token)) => {
-            // `try_pair` is not just validation: by the time we land
-            // here, the pairing code is consumed and the token's
-            // SHA-256 hash is already in `PairingGuard::paired_tokens`.
-            // Every step below must succeed atomically — if any of
-            // them fails, we MUST roll back via
-            // `revoke_token_hash` and return 500 WITHOUT the token
-            // in the body, otherwise the in-process credential state
-            // remains accepted while the operator sees a 500 (and a
-            // usable token if the legacy /pair path leaks it).
             let token_hash = {
                 use sha2::{Digest, Sha256};
                 let hash = Sha256::digest(token.as_bytes());
@@ -469,15 +441,6 @@ pub async fn submit_pairing_enhanced(
                             .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                         "device registry insert failed after successful pairing; rolling back in-process token"
                     );
-                    // Compensating action: drop the just-accepted
-                    // hash so the failed pairing leaves no
-                    // authenticate-able state. The pairing code is
-                    // already consumed (one-shot), so the operator
-                    // must call `initiate_pairing` to issue a new
-                    // code. The orphaned registry row, if any, sits
-                    // until the operator removes it via the
-                    // management UI; the next `revoke_all` /
-                    // `reconcile` cycle cleans it up.
                     state.pairing.revoke_token_hash(&token_hash);
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -491,8 +454,12 @@ pub async fn submit_pairing_enhanced(
                         .into_response();
                 }
             }
-            if let Err(e) =
-                super::persist_pairing_tokens(state.config.clone(), &state.pairing).await
+            if let Err(e) = super::persist_pairing_tokens(
+                state.config.clone(),
+                &state.pairing,
+                state.config_write_lock.clone(),
+            )
+            .await
             {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -501,12 +468,6 @@ pub async fn submit_pairing_enhanced(
                         .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                     "pairing token persistence failed; rolling back in-process token"
                 );
-                // Same compensating action as above: persistence
-                // failed, so a restart would resurrect the in-memory
-                // token. Drop it now and do NOT return the
-                // plaintext token in the body — the previous
-                // behavior leaked a usable bearer on a 200, which
-                // is the very gap this PR closes.
                 state.pairing.revoke_token_hash(&token_hash);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -527,10 +488,26 @@ pub async fn submit_pairing_enhanced(
             }))
             .into_response()
         }
-        Ok(None) => (StatusCode::BAD_REQUEST, "Invalid or expired pairing code").into_response(),
+        Ok(None) => {
+            // Feed the shared auth limiter so repeated invalid codes trip the
+            // cross-request lockout, exactly as the legacy `/pair` handler does.
+            state.auth_limiter.record_attempt(&client_id);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "paired": false,
+                    "error": "Invalid or expired pairing code",
+                })),
+            )
+                .into_response()
+        }
         Err(lockout_secs) => (
             StatusCode::TOO_MANY_REQUESTS,
-            format!("Too many attempts. Locked out for {lockout_secs}s"),
+            Json(serde_json::json!({
+                "paired": false,
+                "error": format!("Too many attempts. Locked out for {lockout_secs}s"),
+                "retry_after": lockout_secs,
+            })),
         )
             .into_response(),
     }
@@ -603,12 +580,13 @@ pub async fn revoke_device(
 
     state.pairing.revoke_token_hash(&token_hash);
 
-    // If persistence fails after the in-memory revoke + row delete, the
-    // device row is already gone and the token is already invalid in this
-    // process; a daemon restart will resurrect the token from the unchanged
-    // on-disk config. Surface that to the caller so they know to re-pair
-    // and audit, rather than treating the operation as silently complete.
-    if let Err(e) = super::persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+    if let Err(e) = super::persist_pairing_tokens(
+        state.config.clone(),
+        &state.pairing,
+        state.config_write_lock.clone(),
+    )
+    .await
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Token revoked in memory but config persist failed: {e}"),
@@ -624,7 +602,6 @@ pub async fn revoke_device(
 }
 
 /// POST /api/devices/me/capabilities — the calling device replaces its capability list.
-///
 /// The "me" path means there's no separate device id in the URL — the bearer token in
 /// Authorization identifies which row gets updated. Body: `{ "capabilities": ["..."] }`.
 pub async fn update_my_capabilities(
@@ -678,22 +655,6 @@ pub async fn update_my_capabilities(
     }
 }
 
-/// POST /api/devices/{id}/token/rotate — revoke the device's current bearer
-/// token and issue a fresh pairing code for re-pairing.
-///
-/// The device row is removed because the schema keys on `token_hash`; once
-/// the token is revoked the row's primary key is dead anyway. Re-pairing
-/// inserts a fresh row with the new token's hash.
-///
-/// The rotation's load-bearing effect is invalidating the leaked token, not
-/// issuing a new code. If another flow holds the pairing-code slot the
-/// revoke still happens; the response reports that no new code was issued
-/// and the operator can use the pending code or call again once it clears.
-///
-/// If the caller is using the same bearer token as the device being rotated
-/// (self-revocation), the response is delivered over the now-invalid token;
-/// subsequent requests from that client will fail until they re-pair. That
-/// is the intended path for "rotate my own token after I think it leaked."
 pub async fn rotate_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -728,7 +689,13 @@ pub async fn rotate_token(
     // Same persist-fail caveat as `revoke_device`: device row + in-memory
     // token are already gone; surfacing the persist error tells the caller
     // a restart could resurrect the token.
-    if let Err(e) = super::persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+    if let Err(e) = super::persist_pairing_tokens(
+        state.config.clone(),
+        &state.pairing,
+        state.config_write_lock.clone(),
+    )
+    .await
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Token revoked in memory but config persist failed: {e}"),
@@ -769,7 +736,9 @@ pub async fn rotate_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GatewayRateLimiter;
     use crate::api::test_state;
+    use crate::auth_rate_limit::{AuthRateLimiter, MAX_ATTEMPTS};
     use axum::Json;
     use http_body_util::BodyExt;
     use std::sync::Arc;
@@ -782,11 +751,6 @@ mod tests {
     fn unwriteable_registry_state() -> AppState {
         let mut state = test_state(Config::default());
         state.pairing = Arc::new(PairingGuard::new(true, &[]));
-        // `/this/path/does/not/exist/devices.db` cannot be opened because
-        // the parent directory does not exist. `open_db` returns
-        // `DatabasePathMissing`/`CannotOpen`, surfacing as
-        // `rusqlite::Error` from `register`. This is the regression
-        // setup we need.
         state.device_registry = Some(Arc::new(DeviceRegistry::with_db_path(PathBuf::from(
             "/this/path/does/not/exist/devices.db",
         ))));
@@ -800,10 +764,6 @@ mod tests {
         (status, json)
     }
 
-    /// If `registry.register(...)` fails after `try_pair` already
-    /// accepted the code, the handler must roll back the in-process
-    /// token (no accepted credential left behind) and must NOT return
-    /// the plaintext bearer in the 500 body.
     #[tokio::test]
     async fn submit_pairing_enhanced_rolls_back_in_process_token_when_registry_register_fails() {
         let state = unwriteable_registry_state();
@@ -817,6 +777,7 @@ mod tests {
         let (status, body) = response_json(
             submit_pairing_enhanced(
                 State(state.clone()),
+                ConnectInfo("127.0.0.1:40000".parse().unwrap()),
                 HeaderMap::new(),
                 Json(serde_json::json!({"code": code, "device_name": "test"})),
             )
@@ -844,28 +805,10 @@ mod tests {
         );
     }
 
-    /// If token persistence to `config.toml` fails after `try_pair`
-    /// already accepted the code, the handler must roll back the
-    /// in-process token (so a restart does not resurrect it) and must
-    /// NOT return the plaintext bearer in the body — the previous
-    /// version leaked a usable bearer on a 200, which is exactly the
-    /// gap this whole PR closes.
     #[tokio::test]
     async fn submit_pairing_enhanced_rolls_back_in_process_token_when_persist_fails() {
         let mut state = test_state(Config::default());
         state.pairing = Arc::new(PairingGuard::new(true, &[]));
-        // No device_registry at all → registry branch is skipped,
-        // so the persistence branch is the only failing step.
-        //
-        // Force `save_dirty` → `write_config_atomically` → `create_dir_all`
-        // to fail deterministically by pointing `config_path` at a file
-        // whose parent segment is itself an ordinary file. `create_dir_all`
-        // then hits ENOTDIR at the kernel level, which root cannot bypass
-        // — unlike the previous `/no/such/dir/config.toml` path, where a
-        // uid-0 CI runner is allowed to create `/no/`, `/no/such/`,
-        // `/no/such/dir/` from `/` and the save silently succeeds, letting
-        // the whole rollback path go untested (and leaking a 200 + token
-        // if it ever regresses).
         let tmp = tempfile::TempDir::new().unwrap();
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"").expect("seed blocker file");
@@ -882,6 +825,7 @@ mod tests {
         let (status, body) = response_json(
             submit_pairing_enhanced(
                 State(state.clone()),
+                ConnectInfo("127.0.0.1:40001".parse().unwrap()),
                 HeaderMap::new(),
                 Json(serde_json::json!({"code": code})),
             )
@@ -905,5 +849,351 @@ mod tests {
             "PairingGuard::paired_tokens must be empty after a failed persist; have {:?}",
             state.pairing.tokens()
         );
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_keys_lockout_on_peer_not_forwarded_header() {
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        // Default config does not trust forwarded headers.
+        assert!(!state.trust_forwarded_headers);
+
+        let peer: SocketAddr = "203.0.113.7:55555".parse().unwrap();
+
+        // Five wrong codes from one peer, each spoofing a different X-Forwarded-For.
+        for i in 0..5 {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Forwarded-For", format!("192.0.2.{i}").parse().unwrap());
+            let (status, _) = response_json(
+                submit_pairing_enhanced(
+                    State(state.clone()),
+                    ConnectInfo(peer),
+                    headers,
+                    Json(serde_json::json!({"code": "wrong"})),
+                )
+                .await
+                .into_response(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "attempt {i} is an invalid code and must not be locked out yet"
+            );
+        }
+
+        // A sixth attempt with yet another spoofed header must be locked out:
+        // the real peer IP keeps every spoofed value in the same bucket.
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", "198.51.100.9".parse().unwrap());
+        let (status, _) = response_json(
+            submit_pairing_enhanced(
+                State(state.clone()),
+                ConnectInfo(peer),
+                headers,
+                Json(serde_json::json!({"code": "wrong"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "lockout must key on the peer IP so X-Forwarded-For spoofing cannot bypass it"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_honors_trusted_forwarded_client_identity() {
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.trust_forwarded_headers = true;
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(1, 100, 100));
+        let peer: SocketAddr = "10.0.0.2:55555".parse().unwrap();
+
+        for forwarded in ["198.51.100.10", "198.51.100.11"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Forwarded-For", forwarded.parse().unwrap());
+            let (status, _) = response_json(
+                submit_pairing_enhanced(
+                    State(state.clone()),
+                    ConnectInfo(peer),
+                    headers,
+                    Json(serde_json::json!({"code": "wrong"})),
+                )
+                .await
+                .into_response(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "trusted forwarded clients must receive independent rate buckets"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", "198.51.100.10".parse().unwrap());
+        let (status, body) = response_json(
+            submit_pairing_enhanced(
+                State(state),
+                ConnectInfo(peer),
+                headers,
+                Json(serde_json::json!({"code": "wrong"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            body["error"],
+            "Too many pairing requests. Please retry later."
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_enforces_pair_request_limiter_threshold() {
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(2, 100, 100));
+        let peer: SocketAddr = "203.0.113.20:55555".parse().unwrap();
+
+        for attempt in 0..2 {
+            let (status, _) = response_json(
+                submit_pairing_enhanced(
+                    State(state.clone()),
+                    ConnectInfo(peer),
+                    HeaderMap::new(),
+                    Json(serde_json::json!({"code": "wrong"})),
+                )
+                .await
+                .into_response(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "attempt {attempt}");
+        }
+
+        let (status, body) = response_json(
+            submit_pairing_enhanced(
+                State(state),
+                ConnectInfo(peer),
+                HeaderMap::new(),
+                Json(serde_json::json!({"code": "wrong"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            body["error"],
+            "Too many pairing requests. Please retry later."
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_enforces_shared_auth_limiter_threshold() {
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
+        state.auth_limiter = Arc::new(AuthRateLimiter::new());
+        let peer: SocketAddr = "203.0.113.30:55555".parse().unwrap();
+        let client_id = peer.ip().to_string();
+        for _ in 0..MAX_ATTEMPTS {
+            state.auth_limiter.record_attempt(&client_id);
+        }
+
+        let (status, body) = response_json(
+            submit_pairing_enhanced(
+                State(state),
+                ConnectInfo(peer),
+                HeaderMap::new(),
+                Json(serde_json::json!({"code": "wrong"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("Too many auth attempts.")),
+            "response must come from the shared authentication limiter: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_invalid_code_feeds_shared_auth_limiter() {
+        // The handler must *record* each invalid attempt into the shared auth
+        // limiter, not merely check pre-existing state. Preload the limiter to
+        // one below the threshold, then a single invalid pairing call must push
+        // it to the threshold so the *next* request is locked out by the shared
+        // limiter. This fails if the handler's `record_attempt` call is dropped:
+        // the second request would still see `MAX_ATTEMPTS - 1` and return 400.
+        // PairingGuard sees only two attempts here (< its 5-attempt lockout), so
+        // it never produces the 429 — the lockout can only come from the shared
+        // limiter the handler fed.
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
+        state.auth_limiter = Arc::new(AuthRateLimiter::new());
+        let peer: SocketAddr = "203.0.113.40:55555".parse().unwrap();
+        let client_id = peer.ip().to_string();
+
+        for _ in 0..(MAX_ATTEMPTS - 1) {
+            state.auth_limiter.record_attempt(&client_id);
+        }
+
+        let (status, _) = response_json(
+            submit_pairing_enhanced(
+                State(state.clone()),
+                ConnectInfo(peer),
+                HeaderMap::new(),
+                Json(serde_json::json!({"code": "wrong"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an invalid code returns 400 and records the attempt into the shared limiter"
+        );
+
+        let (status, body) = response_json(
+            submit_pairing_enhanced(
+                State(state),
+                ConnectInfo(peer),
+                HeaderMap::new(),
+                Json(serde_json::json!({"code": "wrong"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the handler's own recording pushed the shared limiter to its threshold"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("Too many auth attempts.")),
+            "the lockout must come from the shared auth limiter, not PairingGuard: {body}"
+        );
+    }
+
+    /// Serve `submit_pairing_enhanced` on a real loopback listener with
+    /// `ConnectInfo<SocketAddr>` and return the bound address plus the server
+    /// task handle, so tests exercise the outer HTTP + proxy boundary rather
+    /// than calling the handler directly.
+    async fn serve_pairing(state: AppState) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new()
+            .route("/api/pair", axum::routing::post(submit_pairing_enhanced))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        (addr, handle)
+    }
+
+    /// Send one wrong `POST /api/pair` over a fresh connection with the given
+    /// `X-Forwarded-For`, returning the HTTP status code. A raw request keeps
+    /// the test free of an HTTP-client dependency while still driving the real
+    /// service (ConnectInfo + header extraction).
+    async fn post_pair_status(addr: std::net::SocketAddr, forwarded_for: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = r#"{"code":"wrong"}"#;
+        let request = format!(
+            "POST /api/pair HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: {forwarded_for}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        let status_line = text.lines().next().expect("HTTP status line");
+        status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("HTTP status code")
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_http_boundary_rotating_forwarded_header_cannot_evade_lockout()
+    {
+        // Default (untrusted) forwarded headers: a single direct peer rotating
+        // `X-Forwarded-For` on every request must not dodge the peer-keyed
+        // lockout. After five wrong attempts the sixth is locked out (429).
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
+        state.auth_limiter = Arc::new(AuthRateLimiter::new());
+        state.trust_forwarded_headers = false;
+
+        let (addr, server) = serve_pairing(state).await;
+
+        let mut statuses = Vec::new();
+        for i in 0..6 {
+            statuses.push(post_pair_status(addr, &format!("10.0.0.{i}")).await);
+        }
+        server.abort();
+
+        assert_eq!(
+            statuses,
+            vec![400, 400, 400, 400, 400, 429],
+            "rotating X-Forwarded-For from one direct peer must not evade the lockout"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_pairing_enhanced_http_boundary_trusted_proxy_separates_clients() {
+        // Trusted-proxy mode: the forwarded client identity is honoured, so
+        // client A's five failures lock only A. Client B keeps a fresh bucket,
+        // and A's sixth request is the one that is locked out.
+        let mut state = test_state(Config::default());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
+        state.auth_limiter = Arc::new(AuthRateLimiter::new());
+        state.trust_forwarded_headers = true;
+
+        let (addr, server) = serve_pairing(state).await;
+
+        let client_a = "198.51.100.7";
+        let client_b = "198.51.100.8";
+
+        let mut a_statuses = Vec::new();
+        for _ in 0..5 {
+            a_statuses.push(post_pair_status(addr, client_a).await);
+        }
+        let b_status = post_pair_status(addr, client_b).await;
+        let a_sixth = post_pair_status(addr, client_a).await;
+        server.abort();
+
+        assert_eq!(
+            a_statuses,
+            vec![400, 400, 400, 400, 400],
+            "client A's five wrong attempts"
+        );
+        assert_eq!(
+            b_status, 400,
+            "client B has an independent bucket behind the trusted proxy"
+        );
+        assert_eq!(a_sixth, 429, "client A is locked out on its sixth attempt");
     }
 }

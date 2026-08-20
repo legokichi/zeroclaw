@@ -1,17 +1,4 @@
 //! Hardware serial transport — newline-delimited JSON over USB CDC.
-//!
-//! Implements the [`Transport`] trait with **lazy port opening**: the port is
-//! opened for each `send()` call and closed immediately after the response is
-//! received. This means multiple tools can use the same device path without
-//! one holding the port exclusively.
-//!
-//! Wire protocol (ZeroClaw serial JSON):
-//! ```text
-//! Host → Device:  {"cmd":"gpio_write","params":{"pin":25,"value":1}}\n
-//! Device → Host:  {"ok":true,"data":{"pin":25,"value":1,"state":"HIGH"}}\n
-//! ```
-//!
-//! All I/O is wrapped in `tokio::time::timeout` — no blocking reads.
 
 use super::{
     protocol::{ZcCommand, ZcResponse},
@@ -30,14 +17,16 @@ pub const DEFAULT_BAUD: u32 = 115_200;
 /// Timeout for the ping handshake during device discovery (milliseconds).
 const PING_TIMEOUT_MS: u64 = 300;
 
+fn map_send_timeout(source: tokio::time::error::Elapsed) -> TransportError {
+    TransportError::Timeout {
+        secs: SEND_TIMEOUT_SECS,
+        source,
+    }
+}
+
 /// Allowed serial device path prefixes — reject arbitrary paths for security.
 use crate::util::is_serial_path_allowed as is_path_allowed;
 
-/// Serial transport for ZeroClaw hardware devices.
-///
-/// The port is **opened lazily** on each `send()` call and released immediately
-/// after the response is read. This avoids exclusive-hold conflicts between
-/// multiple tools or processes.
 pub struct HardwareSerialTransport {
     port_path: String,
     baud_rate: u32,
@@ -45,7 +34,6 @@ pub struct HardwareSerialTransport {
 
 impl HardwareSerialTransport {
     /// Create a new lazy-open serial transport.
-    ///
     /// Does NOT open the port — that happens on the first `send()` call.
     pub fn new(port_path: impl Into<String>, baud_rate: u32) -> Self {
         Self {
@@ -64,13 +52,6 @@ impl HardwareSerialTransport {
         &self.port_path
     }
 
-    /// Attempt a ping handshake to verify ZeroClaw firmware is running.
-    ///
-    /// Opens the port, sends `{"cmd":"ping","params":{}}`, waits up to
-    /// `PING_TIMEOUT_MS` for a response with `data.firmware == "zeroclaw"`.
-    ///
-    /// Returns `true` if a ZeroClaw device responds, `false` otherwise.
-    /// This method never returns an error — discovery must not hang on failure.
     pub async fn ping_handshake(&self) -> bool {
         let ping = ZcCommand::simple("ping");
         let json = match serde_json::to_string(&ping) {
@@ -124,7 +105,7 @@ impl Transport for HardwareSerialTransport {
             do_send(&self.port_path, self.baud_rate, &json),
         )
         .await
-        .map_err(|_| TransportError::Timeout(SEND_TIMEOUT_SECS))?
+        .map_err(map_send_timeout)?
     }
 
     fn kind(&self) -> TransportKind {
@@ -138,7 +119,6 @@ impl Transport for HardwareSerialTransport {
 }
 
 /// Open the port, write the command, read one response line, return the parsed response.
-///
 /// This is the inner function wrapped with `tokio::time::timeout` by the caller.
 /// Do NOT add a timeout here — the outer caller owns the deadline.
 async fn do_send(path: &str, baud: u32, json: &str) -> Result<ZcResponse, TransportError> {
@@ -279,9 +259,35 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(TransportError::Disconnected | TransportError::Timeout(_))
+                Err(TransportError::Disconnected | TransportError::Timeout { .. })
             ),
             "expected Disconnected or Timeout, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_timeout_mapping_preserves_source_and_classification() {
+        let source = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let err = map_send_timeout(source);
+
+        assert!(matches!(
+            &err,
+            TransportError::Timeout {
+                secs: SEND_TIMEOUT_SECS,
+                ..
+            }
+        ));
+        assert!(
+            std::error::Error::source(&err)
+                .and_then(|source| source.downcast_ref::<tokio::time::error::Elapsed>())
+                .is_some(),
+            "timeout source should remain recoverable"
+        );
+        assert_eq!(
+            err.to_string(),
+            "transport timeout after 5s: deadline has elapsed"
         );
     }
 

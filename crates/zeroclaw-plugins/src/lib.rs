@@ -1,5 +1,4 @@
 //! WASM plugin system for ZeroClaw.
-//!
 //! Plugins are WebAssembly components loaded via wasmtime that can extend
 //! ZeroClaw with custom tools and channels. Enable with a `plugins-wasm*` feature.
 
@@ -7,8 +6,12 @@
 pub mod component;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_logging;
+pub mod config;
+pub mod egress;
+pub mod endpoint;
 pub mod error;
 pub mod host;
+pub mod instance;
 pub mod registry;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod runtime;
@@ -44,6 +47,10 @@ pub struct PluginManifest {
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// Draft 2020-12 JSON Schema for this plugin's private config object.
+    /// Required exactly when `config_read` is requested.
+    #[serde(default)]
+    pub config_schema: Option<serde_json::Value>,
     /// Ed25519 signature over the canonical manifest (base64url-encoded).
     /// Set by the plugin publisher when signing the manifest.
     #[serde(default)]
@@ -54,7 +61,7 @@ pub struct PluginManifest {
 }
 
 /// What a plugin can do.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginCapability {
     /// Provides one or more tools
@@ -70,11 +77,16 @@ pub enum PluginCapability {
 }
 
 /// Permissions a plugin may request.
-#[derive(Debug, Clone, Hash, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginPermission {
     /// Can make HTTP requests
     HttpClient,
+    /// Can open host-mediated outbound WebSocket connections.
+    #[serde(rename = "websocket_client")]
+    WebSocketClient,
+    /// Can open host-mediated outbound TCP, TLS, and STARTTLS connections.
+    SocketClient,
     /// Can read from the filesystem (within sandbox)
     FileRead,
     /// Can write to the filesystem (within sandbox)

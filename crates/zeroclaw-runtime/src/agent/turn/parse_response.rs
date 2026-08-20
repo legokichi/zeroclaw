@@ -1,6 +1,7 @@
-//! Interpretation of a successful provider chat response: observer/cost
-//! recording, native and text-fallback tool-call parsing, parse-issue
-//! detection, and assistant-history construction.
+//! Interpretation of a successful provider chat response: native and
+//! text-fallback tool-call parsing, parse-issue detection, and assistant
+//! history construction. Accepted-only telemetry is emitted by the caller
+//! after it commits the classification.
 
 use super::context::TurnCtx;
 use super::protocol_detect::{
@@ -17,6 +18,7 @@ use zeroclaw_providers::{ChatMessage, ChatResponse, ToolCall};
 use zeroclaw_tool_call_parser::{
     ParsedToolCall, build_native_assistant_history_from_parsed_calls,
     looks_like_tool_protocol_example, parse_tool_calls, strip_think_tags,
+    strip_trailing_terminal_markers,
 };
 
 /// Build assistant history entry in JSON format for native tool-call APIs.
@@ -30,11 +32,15 @@ pub(crate) fn build_native_assistant_history(
     let calls_json: Vec<serde_json::Value> = tool_calls
         .iter()
         .map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "name": tc.name,
-                "arguments": tc.arguments,
-            })
+            let mut call = serde_json::Map::from_iter([
+                ("id".to_string(), serde_json::json!(tc.id)),
+                ("name".to_string(), serde_json::json!(tc.name)),
+                ("arguments".to_string(), serde_json::json!(tc.arguments)),
+            ]);
+            if let Some(extra_content) = &tc.extra_content {
+                call.insert("extra_content".to_string(), extra_content.clone());
+            }
+            serde_json::Value::Object(call)
         })
         .collect();
 
@@ -82,18 +88,23 @@ pub(crate) fn resolve_display_text(
     }
 }
 
-/// Narration to relay after the live stream, given what was already forwarded.
-/// Returns the suffix of `display_text` past `streamed_visible_text` when the
-/// latter is a genuine prefix. On any divergence the whole `display_text` is
-/// relayed: duplicate output is recoverable noise, a dropped tail is permanent
-/// loss, so the total function never truncates.
 pub(crate) fn unforwarded_narration<'a>(
     display_text: &'a str,
     streamed_visible_text: &str,
 ) -> &'a str {
+    if let Some(rest) = display_text.strip_prefix(streamed_visible_text) {
+        return rest;
+    }
+    let stream_lead_normalized = streamed_visible_text.trim_start();
+    if !stream_lead_normalized.is_empty()
+        && let Some(rest) = display_text.strip_prefix(stream_lead_normalized)
+    {
+        return rest;
+    }
+    if streamed_visible_text.trim() == display_text {
+        return "";
+    }
     display_text
-        .strip_prefix(streamed_visible_text)
-        .unwrap_or(display_text)
 }
 
 /// The interpreted Ok-arm of one provider call.
@@ -105,69 +116,30 @@ pub(crate) struct InterpretedResponse {
     pub(crate) native_tool_calls: Vec<ToolCall>,
     pub(crate) parse_issue_detected: bool,
     pub(crate) input_tokens: Option<u64>,
+    /// Full cumulative provider usage.  The caller records this as rejected
+    /// when protocol classification rejects the response.
+    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
 }
 
 /// Interpret a successful chat response. Takes the response by value and
 /// holds no borrows of `ctx` past the call (RUN_SHEET `turn.parse_response`).
 pub(crate) async fn interpret_chat_response(
     ctx: &TurnCtx<'_>,
+    _served_provider: &str,
+    model: &str,
     resp: ChatResponse,
-    history: &[ChatMessage],
+    _history: &[ChatMessage],
     specs: &IterationToolSpecs,
     streamed_protocol_suppressed: bool,
-    llm_started_at: Instant,
     iteration: usize,
     detect_protocol_without_tools: bool,
 ) -> InterpretedResponse {
-    let (resp_input_tokens, resp_output_tokens) = resp
-        .usage
-        .as_ref()
-        .map(|u| (u.input_tokens, u.output_tokens))
-        .unwrap_or((None, None));
-
-    ctx.observer.record_event(&ObserverEvent::LlmResponse {
-        model_provider: ctx.provider_name.to_string(),
-        model: ctx.model.to_string(),
-        duration: llm_started_at.elapsed(),
-        success: true,
-        error_message: None,
-        input_tokens: resp_input_tokens,
-        output_tokens: resp_output_tokens,
-        channel: Some(ctx.channel_name.to_string()),
-        agent_alias: ctx.agent_alias.map(|s| s.to_string()),
-        turn_id: Some(ctx.turn_id.to_string()),
-        // Credential-scrubbed prompt/completion content for OTel GenAI export;
-        // `None` unless the `observability-otel` feature is active.
-        messages: capture_llm_messages(history, Some(resp.text_or_empty()), &resp.tool_calls),
-    });
-
-    // Record cost via the task-local tracker (no-op when not scoped) and keep
-    // the per-call USD so both the Usage event and the llm_response log line
-    // can carry it. `None` = untracked (no cost scope or no usage);
-    // `Some(0.0)` = tracked but unpriced (the missing-pricing WARN fires
-    // inside record_tool_loop_cost_usage in that case).
-    let call_cost_usd = resp
-        .usage
-        .as_ref()
-        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage))
-        .map(|(_total_tokens, cost_usd)| cost_usd);
-
-    // Per-LLM-call usage event, right after the observer success event
-    // (upstream E2 parity, agent.rs Usage emission).
-    if let Some(tx) = ctx.event_tx
-        && let Some(ref usage) = resp.usage
-    {
-        let _ = tx
-            .send(TurnEvent::Usage {
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                output_tokens: usage.output_tokens,
-                cost_usd: call_cost_usd,
-            })
-            .await;
-    }
+    let resp_input_tokens = resp.usage.as_ref().and_then(|usage| usage.input_tokens);
 
     let response_text = strip_think_tags(resp.text_or_empty());
+    // Strip trailing terminal markers (`<eom>`, `<|eom|>`) from non-streaming responses.
+    // Handles stacked markers with arbitrary whitespace between them.
+    let response_text = strip_trailing_terminal_markers(&response_text);
     // First try native structured tool calls (OpenAI-format).
     // Fall back to text-based parsing (XML tags, markdown blocks,
     // GLM format) only if the model_provider returned no native calls —
@@ -228,7 +200,11 @@ pub(crate) async fn interpret_chat_response(
             &specs.known_tool_names,
         )
         .or_else(|| {
-            streamed_protocol_suppressed.then(|| {
+            // A guard-suppressed stream that reconstructed a valid tool call
+            // is not malformed: its envelope was deliberately withheld from
+            // display and is represented by `calls`. Keep the guard as a
+            // rejection only when parsing left no valid call to execute.
+            (streamed_protocol_suppressed && calls.is_empty()).then(|| {
                 "streaming text guard suppressed an internal tool protocol envelope".to_string()
             })
         })
@@ -240,7 +216,7 @@ pub(crate) async fn interpret_chat_response(
                 .with_category(::zeroclaw_log::EventCategory::Tool)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
-                    "model": ctx.model,
+                    "model": model,
                     "iteration": iteration + 1,
                     "issue": issue.as_str(),
                     "response": scrub_credentials(&response_text),
@@ -249,26 +225,6 @@ pub(crate) async fn interpret_chat_response(
             "tool_call_parse_issue"
         );
     }
-
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
-            .with_category(::zeroclaw_log::EventCategory::Provider)
-            .with_outcome(::zeroclaw_log::EventOutcome::Success)
-            .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
-            .with_attrs(::serde_json::json!({
-                "model": ctx.model,
-                "iteration": iteration + 1,
-                "input_tokens": resp_input_tokens,
-                "output_tokens": resp_output_tokens,
-                "cost_usd": call_cost_usd,
-                "raw_response": scrub_credentials(&response_text),
-                "native_tool_calls": resp.tool_calls.len(),
-                "parsed_tool_calls": calls.len(),
-                "trace_id": ctx.turn_id,
-            })),
-        "llm_response"
-    );
 
     // Preserve native tool call IDs in assistant history so role=tool
     // follow-up messages can reference the exact call id.
@@ -301,12 +257,105 @@ pub(crate) async fn interpret_chat_response(
         native_tool_calls: native_calls,
         parse_issue_detected: parse_issue.is_some(),
         input_tokens: resp_input_tokens,
+        usage: resp.usage,
     }
+}
+
+/// Emit effects which are valid only after the turn loop accepts the parsed
+/// response. Keeping this separate from interpretation prevents a malformed
+/// transport success from advancing accepted accounting or success telemetry.
+pub(crate) async fn record_accepted_chat_response(
+    ctx: &TurnCtx<'_>,
+    served_provider: &str,
+    model: &str,
+    response_text: &str,
+    native_tool_calls: &[ToolCall],
+    parsed_tool_calls: usize,
+    usage: Option<&zeroclaw_providers::traits::TokenUsage>,
+    history: &[ChatMessage],
+    llm_started_at: Instant,
+    iteration: usize,
+) {
+    let input_tokens = usage.and_then(|usage| usage.input_tokens);
+    let output_tokens = usage.and_then(|usage| usage.output_tokens);
+    ctx.observer.record_event(&ObserverEvent::LlmResponse {
+        model_provider: served_provider.to_string(),
+        model: model.to_string(),
+        duration: llm_started_at.elapsed(),
+        success: true,
+        error_message: None,
+        input_tokens,
+        output_tokens,
+        channel: Some(ctx.channel_name.to_string()),
+        agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
+        turn_id: Some(ctx.turn_id.to_string()),
+        messages: capture_llm_messages(history, Some(response_text), native_tool_calls),
+    });
+    let cost_usd = usage
+        .and_then(|usage| record_tool_loop_cost_usage(served_provider, model, usage))
+        .map(|(_total_tokens, cost_usd)| cost_usd);
+    if let Some(tx) = ctx.event_tx
+        && let Some(usage) = usage
+    {
+        let _ = tx
+            .send(TurnEvent::Usage {
+                input_tokens: usage.input_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                output_tokens: usage.output_tokens,
+                cost_usd,
+            })
+            .await;
+    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .with_attrs(::serde_json::json!({
+                "model": model,
+                "iteration": iteration + 1,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": cost_usd,
+                "raw_response": scrub_credentials(response_text),
+                "native_tool_calls": native_tool_calls.len(),
+                "parsed_tool_calls": parsed_tool_calls,
+                "trace_id": ctx.turn_id,
+            })),
+        "llm_response"
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::unforwarded_narration;
+    use super::{build_native_assistant_history, unforwarded_narration};
+    use zeroclaw_providers::ToolCall;
+
+    #[test]
+    fn native_assistant_history_preserves_tool_call_extra_content() {
+        let history = build_native_assistant_history(
+            "",
+            &[ToolCall {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: Some(serde_json::json!({
+                    "google": {
+                        "thought_signature": "sig_1"
+                    }
+                })),
+            }],
+            None,
+        );
+
+        let value = serde_json::from_str::<serde_json::Value>(&history).unwrap();
+        assert_eq!(
+            value["tool_calls"][0]["extra_content"],
+            serde_json::json!({"google": {"thought_signature": "sig_1"}})
+        );
+    }
 
     #[test]
     fn returns_suffix_when_streamed_text_is_a_prefix() {
@@ -339,6 +388,46 @@ mod tests {
             "final visible text"
         );
     }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_trailing_whitespace() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "Checking the data.\n\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_leading_whitespace() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "\n\nChecking the data."),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_whitespace_on_both_ends() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "\n\nChecking the data.\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_suffix_past_the_whitespace_trimmed_streamed_prefix() {
+        assert_eq!(
+            unforwarded_narration("About to check.", "\nAbout to"),
+            " check."
+        );
+    }
+
+    #[test]
+    fn preserves_trailing_prefix_space_when_only_the_leading_edge_diverges() {
+        assert_eq!(
+            unforwarded_narration("About to check.", "\nAbout to "),
+            "check."
+        );
+    }
 }
 
 #[cfg(test)]
@@ -348,17 +437,6 @@ mod cost_usd_regression_tests {
     use std::sync::Arc;
     use zeroclaw_providers::traits::TokenUsage;
 
-    /// Regression guard for the per-call USD that
-    /// `record_tool_loop_cost_usage` returns and `interpret_chat_response`
-    /// threads into BOTH the `TurnEvent::Usage { cost_usd }` event and the
-    /// `cost_usd` attribute of the `llm_response` log record. The test fails
-    /// if either path drops the cost.
-    ///
-    /// Pricing/usage are picked so the expected cost is an exact f64:
-    ///   input  = 2_000_000 tokens @ 1.5 / 1e6  = 3.0
-    ///   output = 1_000_000 tokens @ 3.0 / 1e6  = 3.0
-    ///   cached = 0 tokens                       = 0.0
-    ///   expected total                          = 6.0
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn cost_usd_flows_to_usage_event_and_llm_response() {
@@ -399,6 +477,7 @@ mod cost_usd_regression_tests {
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let dedup_exempt_tools: Vec<String> = Vec::new();
         let ctx = TurnCtx {
+            parent_agent_alias: None,
             observer: &crate::observability::NoopObserver,
             provider_name: provider,
             model,
@@ -449,7 +528,31 @@ mod cost_usd_regression_tests {
         let now = std::time::Instant::now();
         crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(cost_ctx), async {
-                interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false).await;
+                let interpreted = interpret_chat_response(
+                    &ctx,
+                    provider,
+                    model,
+                    resp,
+                    &[],
+                    &specs,
+                    false,
+                    0,
+                    false,
+                )
+                .await;
+                record_accepted_chat_response(
+                    &ctx,
+                    provider,
+                    model,
+                    &interpreted.response_text,
+                    &interpreted.native_tool_calls,
+                    interpreted.tool_calls.len(),
+                    interpreted.usage.as_ref(),
+                    &[],
+                    now,
+                    0,
+                )
+                .await;
             })
             .await;
 
@@ -481,6 +584,8 @@ mod cost_usd_regression_tests {
                         .and_then(|v| v.as_str())
                         .map(|s| s == "llm_response")
                         .unwrap_or(false)
+                        && value.get("trace_id").and_then(|v| v.as_str())
+                            == Some("turn-cost-regression")
                     {
                         found_cost = Some(
                             value
@@ -503,5 +608,75 @@ mod cost_usd_regression_tests {
         );
 
         zeroclaw_log::clear_broadcast_hook();
+    }
+
+    #[tokio::test]
+    async fn malformed_protocol_retains_usage_without_accepted_usage_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(1);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools = Vec::new();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "requested.provider",
+            model: "requested-model",
+            temperature: None,
+            approval: None,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&tx),
+            hooks: None,
+            dedup_exempt_tools: &dedup_exempt_tools,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: None,
+            turn_id: "malformed-protocol-usage",
+        };
+        let specs = IterationToolSpecs {
+            tool_specs: vec![crate::tools::ToolSpec::new(
+                "shell",
+                "run a command",
+                serde_json::json!({"type": "object"}),
+            )],
+            known_tool_names: HashSet::from(["shell".to_string()]),
+            use_native_tools: false,
+        };
+        let usage = TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cached_input_tokens: None,
+        };
+        let interpreted = interpret_chat_response(
+            &ctx,
+            "served.provider",
+            "served-model",
+            ChatResponse {
+                text: Some(
+                    "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}</tool_call>"
+                        .to_string(),
+                ),
+                tool_calls: vec![],
+                usage: Some(usage.clone()),
+                reasoning_content: None,
+            },
+            &[],
+            &specs,
+            false,
+            0,
+            false,
+        )
+        .await;
+
+        assert!(interpreted.parse_issue_detected);
+        let retained_usage = interpreted.usage.expect("malformed usage must be retained");
+        assert_eq!(retained_usage.input_tokens, usage.input_tokens);
+        assert_eq!(retained_usage.output_tokens, usage.output_tokens);
+        assert!(
+            rx.try_recv().is_err(),
+            "malformed output must not emit accepted Usage"
+        );
     }
 }

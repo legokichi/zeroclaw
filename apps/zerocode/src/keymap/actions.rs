@@ -1,9 +1,4 @@
 //! Action enums for the keymap.
-//!
-//! Each enum is produced by the `keyactions!` macro. Every variant
-//! declares its default chords and label inline; the macro generates
-//! the enum, `Serialize`/`Deserialize` derives, `label()`,
-//! `bindings()`, and `from_chord()` from one source.
 
 use serde::{Deserialize, Serialize};
 
@@ -123,7 +118,10 @@ use crossterm::event::{KeyCode, KeyModifiers};
 keyactions! {
     pub enum GlobalAction ("global") {
         Quit         [Chord::ctrl('c')]                                 => "quit",
-        Help         [Chord::char('?'), Chord::key(KeyCode::F(1)), Chord::with(KeyCode::F(1), KeyModifiers::CONTROL)]      => "help",
+        Help         [
+            Chord::char('?'),
+            Chord::ctrl('g'),
+        ]                                                              => "help",
         PaneNavLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)]  => "prev pane",
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
         ReloadDaemon [Chord::ctrl('r')]                                 => "reload daemon",
@@ -141,8 +139,11 @@ keyactions! {
         JumpStart               [Chord::char('g')] => "jump to start",
         JumpEnd                 [Chord::char('G')] => "jump to end",
         // Use alt+shift+up/down to avoid macOS Mission Control conflict (ctrl+up/down)
-        // and queue navigation conflict (alt+up/down). See issue #8075.
-        BrowseEnter             [Chord::with(KeyCode::Up, KeyModifiers::ALT.union(KeyModifiers::SHIFT)), Chord::ctrl('k')] => "enter browse mode",
+        // and queue navigation conflict (alt+up/down).
+        BrowseEnter             [
+            Chord::with(KeyCode::Up, KeyModifiers::ALT.union(KeyModifiers::SHIFT)),
+            Chord::ctrl('k'),
+        ] => "enter browse mode",
         BrowseExit              [Chord::with(KeyCode::Down, KeyModifiers::ALT.union(KeyModifiers::SHIFT))] => "exit browse mode",
         BrowseUp                [Chord::key(KeyCode::Up)] => "browse prev",
         BrowseDown              [Chord::key(KeyCode::Down)] => "browse next",
@@ -153,7 +154,10 @@ keyactions! {
         FastScrollUp            [Chord::with(KeyCode::Up, KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "fast scroll up",
         FastScrollDown          [Chord::with(KeyCode::Down, KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "fast scroll down",
         BrowseExitSelection     [Chord::key(KeyCode::Esc)] => "exit selection",
-        CopySelection           [Chord::char('y')] => "copy selection",
+        CopySelection           [
+            Chord::char('y'),
+            Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
+        ] => "copy selection",
         CopyAllVisible          [Chord::with(KeyCode::Char('C'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "copy all visible",
         ToggleThoughts          [Chord::char('t')] => "toggle thoughts",
         TodoToggle              [Chord::ctrl('p')] => "toggle todo tracker",
@@ -169,6 +173,8 @@ keyactions! {
         PauseResumeQueue        [Chord::with(KeyCode::Char('p'), KeyModifiers::ALT)] => "pause/resume queue",
         QueueNavUp              [Chord::with(KeyCode::Up, KeyModifiers::ALT)] => "queue prev",
         QueueNavDown            [Chord::with(KeyCode::Down, KeyModifiers::ALT)] => "queue next",
+        QueueSendNow            [Chord::with(KeyCode::Char('s'), KeyModifiers::ALT)] => "send queued now",
+        QueueCopy               [Chord::with(KeyCode::Char('c'), KeyModifiers::ALT)] => "copy queued",
         QueueDelete             [Chord::with(KeyCode::Char('x'), KeyModifiers::ALT)] => "delete queued",
         QueueEdit               [Chord::with(KeyCode::Char('e'), KeyModifiers::ALT)] => "edit queued",
         QueueWiden              [Chord::shift(KeyCode::Left)] => "widen queue",
@@ -225,6 +231,7 @@ keyactions! {
         DetailWidenDown  [Chord::shift(KeyCode::Down)] => "widen detail down",
         BeginSearch      [Chord::char('/')] => "search",
         CopyDetail       [Chord::char('c')] => "copy detail",
+        RenameAgent      [Chord::char('e')] => "rename agent",
         KillSession      [Chord::char('X')] => "kill session",
         TriggerCron      [Chord::char('R')] => "run cron job now",
         Refresh          [Chord::char('r')] => "refresh",
@@ -318,6 +325,8 @@ keyactions! {
         NewLine            [Chord::shift(KeyCode::Enter)] => "new line",
         CursorLeft         [Chord::key(KeyCode::Left)] => "cursor left",
         CursorRight        [Chord::key(KeyCode::Right)] => "cursor right",
+        CursorWordLeft     [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)] => "word left",
+        CursorWordRight    [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "word right",
         CursorStart        [Chord::key(KeyCode::Home)] => "line start",
         CursorEnd          [Chord::key(KeyCode::End), Chord::ctrl('e')] => "line end",
         OpenFileBrowser    [Chord::ctrl('a')] => "browse files",
@@ -387,8 +396,38 @@ keyactions! {
         Cancel    [Chord::key(KeyCode::Esc)] => "cancel",
         Save      [Chord::ctrl('s')] => "save",
         Backspace [Chord::key(KeyCode::Backspace)] => "backspace",
+        CursorLeft      [Chord::key(KeyCode::Left)] => "cursor left",
+        CursorRight     [Chord::key(KeyCode::Right)] => "cursor right",
+        CursorWordLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)] => "word left",
+        CursorWordRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "word right",
+        CursorStart     [Chord::key(KeyCode::Home)] => "input start",
+        CursorEnd       [Chord::key(KeyCode::End)] => "input end",
         Up        [Chord::key(KeyCode::Up)] => "prev",
         Down      [Chord::key(KeyCode::Down)] => "next",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+
+    #[test]
+    fn copy_selection_resolves_from_super_c_and_terminal_fallback() {
+        let command_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+        assert_eq!(
+            ChatTabAction::from_chord(&command_c),
+            Some(ChatTabAction::CopySelection)
+        );
+
+        let terminal_copy = KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+        );
+        assert_eq!(
+            ChatTabAction::from_chord(&terminal_copy),
+            Some(ChatTabAction::CopyAllVisible)
+        );
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, run_tool_call_loop,
@@ -30,6 +31,15 @@ use zeroclaw_tools::memory_store::MemoryStoreTool;
 
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
+}
+
+fn invalid_semantic_completion_error(agent_name: &str) -> String {
+    crate::agent::turn::outcome::semantic_empty_terminal_completion_message(Some(agent_name))
+}
+
+fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
+    crate::agent::turn::outcome::terminal_completion_error_message(error, Some(agent_name))
+        .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
 }
 
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
@@ -105,20 +115,6 @@ impl BackgroundResultState {
     }
 }
 
-/// Tool that delegates a subtask to a named agent with a different
-/// model_provider/model configuration. Enables multi-agent workflows where
-/// a primary agent can hand off specialized work (research, coding,
-/// summarization) to purpose-built sub-agents.
-///
-/// Supports three execution modes:
-/// - **Synchronous** (default): blocks until the sub-agent completes.
-/// - **Background** (`background: true`): spawns the sub-agent in a tokio
-///   task and returns a `task_id` immediately.
-/// - **Parallel** (`parallel: [...]`): runs multiple agents concurrently
-///   and returns all results.
-///
-/// Background results are persisted to `workspace/delegate_results/{task_id}.json`
-/// and can be retrieved via `action: "check_result"`.
 pub struct DelegateTool {
     agents: Arc<HashMap<String, AliasedAgentConfig>>,
     security: Arc<SecurityPolicy>,
@@ -156,6 +152,15 @@ pub struct DelegateTool {
     /// time. When unset (legacy unit-test constructors), DelegateTool falls
     /// back to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
+    /// The daemon's shared live-config handle, when the registry that built
+    /// this tool had one. `root_config` above is a *snapshot* taken at
+    /// construction; every nested registry this tool builds must additionally
+    /// receive this handle so the target's per-execution resolvers (plugin
+    /// `[plugins.entries.config]`, `send_via` peer-group authority) follow
+    /// config reloads and credential rotation instead of the startup snapshot.
+    /// `None` for one-shot / non-daemon callers, which keep the documented
+    /// snapshot fallback.
+    live_config: Option<Arc<RwLock<Config>>>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
@@ -167,12 +172,6 @@ enum DelegateAdmission {
     /// This call entered through the user-visible `delegate` tool and must run
     /// caller-side tool authorization plus target reachability checks.
     Required,
-    /// The parent path already admitted the request before spawning work.
-    ///
-    /// Background workers use this after the parent has returned a task id with
-    /// a resolved target policy. Re-running the full admission inside that
-    /// worker would ask whether the child target can delegate to itself, which
-    /// is not the authorization question being answered.
     Prevalidated,
 }
 
@@ -219,34 +218,15 @@ impl DelegateAction {
     }
 }
 
-/// The independent-delegate registry plus the deferred-MCP side-channels the
-/// sub-agent turn needs. Independent delegation assembles the target's full
-/// runtime registry (built-ins + granted MCP + skills), and deferred MCP mode
-/// surfaces its tools through a prompt section (`deferred_section`) and a live
-/// activated set (`activated_handle`) that the sub-agent loop must inject and
-/// thread - exactly as a fresh target turn (`Agent::from_config`) does.
-struct IndependentTargetTools {
-    tools: Vec<Box<dyn Tool>>,
+pub(crate) struct IndependentTargetTools {
+    pub(crate) tools: Vec<Box<dyn Tool>>,
     /// The deferred-MCP + pinned-resources system-prompt section (empty unless
     /// the target has granted MCP bundles under deferred loading).
     deferred_section: String,
     /// Live handle to the deferred-MCP activated set (Some only when a deferred
     /// `tool_search` tool was registered), threaded into the sub-agent turn loop.
     activated_handle: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    /// The TARGET agent's workspace dir (`config.agent_workspace_dir(target)`),
-    /// resolved once here so the sub-agent's skill *prompt* content is built from
-    /// the same workspace its skill *tools* were loaded from - matching a fresh
-    /// target turn (`loop_.rs` uses `config.agent_workspace_dir(agent_alias)` for
-    /// both). Without this the prompt would describe the *caller's* skills while
-    /// the tools come from the target's.
     workspace_dir: PathBuf,
-    /// The TARGET agent's skills, loaded via the canonical per-agent loader
-    /// (`load_skills_for_agent_from_config`, which unions the workspace,
-    /// open-skills, plugin, and `skill_bundles` sources). Threaded into the
-    /// sub-agent prompt so the SkillsSection describes exactly the skill tools
-    /// that were assembled; `build_enriched_system_prompt`'s local bundle resolver
-    /// only sees `skill_bundles`, so without this override the prompt could omit
-    /// skills the delegate can actually call.
     skills: Vec<crate::skills::Skill>,
 }
 
@@ -296,6 +276,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
         }
     }
@@ -343,6 +324,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
         }
     }
@@ -387,11 +369,6 @@ impl DelegateTool {
         self
     }
 
-    /// Resolve a target sub-agent's workspace dir for identity-file
-    /// loading. Delegates to `Config::agent_workspace_dir` so the
-    /// per-agent path lives in one place; returns `None` when no
-    /// `root_config` is attached (legacy unit-test constructors), which
-    /// callers treat as "no identity files to load".
     fn agent_workspace(&self, agent_alias: &str) -> Option<PathBuf> {
         self.root_config
             .as_ref()
@@ -451,6 +428,21 @@ impl DelegateTool {
         self
     }
 
+    /// Attach the daemon's shared live-config handle alongside
+    /// [`Self::with_root_config`].
+    ///
+    /// `with_root_config` supplies the snapshot this tool reads synchronously
+    /// (reachability, target mode, per-target policy). This supplies the handle
+    /// that every *nested* registry built for a delegated target needs so its
+    /// per-execution resolvers follow reloads. Passing `None` is the documented
+    /// one-shot behavior and keeps the snapshot fallback; dropping the handle
+    /// when the caller has one silently pins delegated plugin tools to startup
+    /// config for the parent's whole lifetime.
+    pub fn with_live_config(mut self, live_config: Option<Arc<RwLock<Config>>>) -> Self {
+        self.live_config = live_config;
+        self
+    }
+
     /// Set the owning agent's alias so it can be excluded from the
     /// advertised delegation roster (an agent must never delegate to
     /// itself).
@@ -459,20 +451,10 @@ impl DelegateTool {
         self
     }
 
-    /// Resolve the target's `SecurityPolicy` for delegation.
-    ///
-    /// Refuses when the caller's `delegation_policy` forbids delegation
-    /// or the target is outside the caller's reachable set. Bounded
-    /// targets share the caller's action/cost tracker and, for same-profile
-    /// targets, inherit the caller's session workspace boundary (issue
-    /// #7263). Cross-profile bounded targets still run under the target's
-    /// configured policy; the bounded ceiling is enforced by drawing
-    /// agentic tools from the caller's registry and intersecting with the
-    /// target risk profile. Independent targets run under their own
-    /// configured policy and tool registry. Falls back to the caller's
-    /// policy when no `root_config` is attached (legacy unit-test
-    /// constructors).
-    fn policy_for_target(&self, target_alias: &str) -> anyhow::Result<Arc<SecurityPolicy>> {
+    pub(crate) fn policy_for_target(
+        &self,
+        target_alias: &str,
+    ) -> anyhow::Result<Arc<SecurityPolicy>> {
         let Some(config) = self.root_config.as_ref() else {
             return Ok(Arc::clone(&self.security));
         };
@@ -561,11 +543,6 @@ impl DelegateTool {
         Ok(Arc::new(target_policy))
     }
 
-    /// Build the user-facing refusal for a target outside the caller's roster.
-    ///
-    /// The reachability resolver intentionally returns only `None` for "not
-    /// reachable"; this helper re-reads canonical config to explain which
-    /// branch failed without duplicating the admission decision itself.
     fn unreachable_target_error(&self, config: &Config, target_alias: &str) -> String {
         let Some(caller) = config.agents.get(&self.caller_alias) else {
             return format!(
@@ -631,11 +608,6 @@ impl DelegateTool {
         )
     }
 
-    /// Resolve the target mode for execution paths that already admitted it.
-    ///
-    /// Legacy unit-test constructors have no root config, so they keep the old
-    /// bounded behavior. Production instances always carry `root_config` and
-    /// therefore resolve through the canonical roster.
     fn mode_for_target(&self, target_alias: &str) -> DelegateExecutionMode {
         self.root_config
             .as_ref()
@@ -643,27 +615,6 @@ impl DelegateTool {
             .unwrap_or(DelegateExecutionMode::Bounded)
     }
 
-    /// Runtime-only guard for independent targets whose risk profile still
-    /// declares `always_ask`.
-    ///
-    /// Independent delegation deliberately runs under the target agent's own
-    /// policy and tool registry (#8238, related to the broader delegation ask
-    /// in #7743). That is fine for target-owned authorization, but
-    /// `always_ask` is a runtime approval contract: starting an independent
-    /// child that can later ask for approval would require an approval
-    /// forwarding channel back through the parent. That channel is explicitly
-    /// out of scope for independent-delegates PR #8239, so fail closed
-    /// here before any target run, task id, or parallel spawn is created.
-    ///
-    /// Keep this centralized. Sync, background, and parallel paths all call
-    /// the same helper so the refusal string and structured diagnostics do not
-    /// drift, and so a future approval-forwarding implementation has one
-    /// temporary guard to remove.
-    ///
-    /// References:
-    /// - https://github.com/zeroclaw-labs/zeroclaw/issues/8238
-    /// - https://github.com/zeroclaw-labs/zeroclaw/issues/7743
-    /// - https://github.com/zeroclaw-labs/zeroclaw/pull/8239
     fn independent_always_ask_refusal(&self, target_alias: &str) -> Option<ToolResult> {
         let config = self.root_config.as_ref()?;
         if config.delegate_target_mode(&self.caller_alias, target_alias)
@@ -724,24 +675,17 @@ impl DelegateTool {
         model_provider: &str,
         provider_type: &str,
         credential: Option<&str>,
-    ) -> anyhow::Result<Box<dyn ModelProvider>> {
-        if let Some(config) = self.root_config.as_deref()
-            && let Some((family, alias)) = model_provider.split_once('.')
-        {
-            let mut options =
-                zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias);
-            if options.zeroclaw_dir.is_none() {
-                options.zeroclaw_dir = self.provider_runtime_options.zeroclaw_dir.clone();
-            }
-            return zeroclaw_providers::create_model_provider_for_alias(
-                config, family, alias, credential, &options,
-            );
+    ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
+        if let Some(config) = self.root_config.as_deref() {
+            return crate::agent::agent::build_session_model_provider(config, model_provider, None);
         }
-        zeroclaw_providers::create_model_provider_with_options(
+        let provider = zeroclaw_providers::create_model_provider_with_options(
             provider_type,
             credential,
             &self.provider_runtime_options,
-        )
+        )?;
+        let (_, _, model, _) = self.resolve_brain(model_provider);
+        Ok((provider, provider_type.to_string(), model))
     }
 
     async fn memory_for_target_agent(
@@ -773,19 +717,7 @@ impl DelegateTool {
         ]
     }
 
-    /// Build the full target-owned registry for an independent agentic child.
-    ///
-    /// Bounded agentic delegation starts from the caller's already-filtered
-    /// `parent_tools`. Independent delegation is intentionally different: it is
-    /// equivalent to starting a fresh target-agent turn, so the registry comes
-    /// from the target risk profile, target workspace, target memory, and target
-    /// provider credentials, assembled through the same `ScopedToolRegistry::assemble`
-    /// seam a real target turn uses - including the target's granted MCP-bundle
-    /// tools and callable skill tools. The only cross-cutting restriction retained
-    /// here is stripping `delegate` itself, because recursive agentic delegation is
-    /// still not supported. Returns the registry plus the deferred-MCP prompt section
-    /// and activated-set handle the caller threads into the sub-agent turn.
-    async fn independent_agentic_tools_for_target(
+    pub(crate) async fn independent_agentic_tools_for_target(
         &self,
         agent_name: &str,
         target_policy: Arc<SecurityPolicy>,
@@ -849,35 +781,20 @@ impl DelegateTool {
             None,
             None,
             None,
-            None,
+            // The delegated target's registry is built once, here, but its
+            // plugin tools and `send_via` authority resolve per execution. They
+            // must resolve against the daemon's shared handle, not the
+            // `root_config` snapshot this DelegateTool captured at
+            // construction - otherwise a reload or credential rotation is
+            // invisible to every delegated plugin tool for the parent's whole
+            // lifetime. `None` only when the parent registry itself had no live
+            // handle (one-shot callers), which keeps the snapshot fallback.
+            self.live_config.clone(),
         );
 
-        // Load the TARGET agent's skills - the same "fresh turn" loader run() and
-        // from_config use (`_from_config` resolves the target's workspace + skill_bundles
-        // from the alias) - so an independent delegate exposes the target's callable skill
-        // tools, not an empty set. Resolve the target workspace explicitly too, so the
-        // caller can build the sub-agent's skill *prompt* from the SAME workspace these
-        // skill *tools* came from (the loader resolves `config.agent_workspace_dir(target)`
-        // internally). NB: this is the target's config workspace, not `target_policy
-        // .workspace_dir` (which policy_for_target rebinds to the caller's cwd when caller
-        // and target share a risk profile) - matching loop_.rs, which uses
-        // `config.agent_workspace_dir(agent_alias)` for both skills and prompt.
         let target_workspace = config.agent_workspace_dir(agent_name);
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_name);
 
-        // Route the independent-target registry through the one gated seam - the same
-        // `assemble` seam run(), process_message, and the gateway use. Independent
-        // delegation is "like opening a fresh chat with the target"
-        // (docs/book/src/agents/delegation.md), so it assembles the TARGET's FULL runtime
-        // registry: assemble step 2 filters with the TARGET's SecurityPolicy (the #8239
-        // invariant - target tools, not the caller's), `connect_mcp: true` connects the
-        // target's granted MCP bundles (omission is not a grant), and the target's skills
-        // register as tools. caller_allowed is None (no per-run allowlist here).
-        // `connect_peripherals` stays FALSE deliberately: a delegate sub-loop must not open
-        // the serial hardware the live daemon holds exclusively. `emit_assembly_logs: true`
-        // because this is an execution surface. The `delegate` tool is stripped afterward
-        // because `all_tools_with_runtime` injects it and an independent delegate must not
-        // recurse into further delegation.
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config,
@@ -890,8 +807,15 @@ impl DelegateTool {
                 connect_mcp: true,
                 connect_peripherals: false,
                 exclude_memory: false,
+                acp_delivery: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
+                // Delegate: targets are short-lived independent chat
+                // sessions with no cross-turn reuse contract, so the
+                // per-call `connect_all` is the correct choice. The
+                // daemon heartbeat worker is the only `mcp_registry`
+                // supplier.
+                mcp_registry: None,
             },
         )
         .await;
@@ -924,9 +848,13 @@ impl DelegateTool {
         {
             return (
                 type_key.to_string(),
-                cfg.api_key
-                    .clone()
-                    .or_else(|| self.global_credential.clone()),
+                if cfg.requires_openai_auth {
+                    cfg.api_key.clone()
+                } else {
+                    cfg.api_key
+                        .clone()
+                        .or_else(|| self.global_credential.clone())
+                },
                 cfg.model.clone().unwrap_or_default(),
                 cfg.temperature,
             );
@@ -985,11 +913,6 @@ impl DelegateTool {
             .unwrap_or(false)
     }
 
-    /// Resolve the runtime-profile knobs the delegate sub-loop consumes.
-    ///
-    /// Production DelegateTool instances carry `root_config`, so use the
-    /// canonical config resolver there. The fallback only serves legacy unit
-    /// constructors that build DelegateTool from raw maps without a full Config.
     fn resolve_loop_runtime(
         &self,
         agent_alias: &str,
@@ -1025,21 +948,6 @@ impl DelegateTool {
         resolved
     }
 
-    /// Materialize the tool gate from the named risk profile (authorization).
-    ///
-    /// Returns `None` when the risk profile is unnamed or not configured.
-    /// `allowed_tools = Some(vec![])` means "deny all" and is preserved as
-    /// `Some(empty)` so the caller can distinguish it from "no risk profile."
-    ///
-    /// The resulting `SecurityPolicy` only carries the tool authorization
-    /// fields (`allowed_tools` and `excluded_tools`). Callers in
-    /// `execute_agentic` must use [`Self::delegate_admits_with_mcp`] — not the
-    /// raw `SecurityPolicy::is_tool_allowed` — to filter `parent_tools`,
-    /// because the delegate path applies the MCP `<server>__<tool>`
-    /// auto-admit exception described on `RiskProfileConfig::allowed_tools`.
-    /// The exception is intentionally scoped to the risk-profile gate; it
-    /// does not apply to caller-supplied per-run allow-lists (cron jobs and
-    /// other narrowers) — see PR #7547 review.
     fn resolve_tool_policy(&self, risk_profile: &str) -> Option<SecurityPolicy> {
         if risk_profile.is_empty() {
             return None;
@@ -1061,23 +969,6 @@ impl DelegateTool {
         })
     }
 
-    /// MCP-aware admission check used to filter `parent_tools` in
-    /// `execute_agentic`.
-    ///
-    /// Same contract as `SecurityPolicy::is_tool_allowed`, with one
-    /// addition that the delegate path needs: when the risk profile's
-    /// `allowed_tools` is `Some(non-empty)`, any name containing `__`
-    /// (the `<server>__<tool>` MCP wrapper convention) is auto-admitted
-    /// even if it is not explicitly listed in `allowed_tools`. The
-    /// `excluded_tools` deny-list always applies last, so destructive
-    /// MCP capabilities like `filesystem__write_file` can be blocked
-    /// individually.
-    ///
-    /// This auto-admit applies only to the risk-profile gate. Callers
-    /// that need a per-run narrowing (cron jobs, narrowed delegate
-    /// invocations) intersect their own allow-list against this result
-    /// with a strict `list.contains(name)` check — see
-    /// `ToolAccessPolicy::is_tool_allowed` and PR #7547.
     fn delegate_admits_with_mcp(policy: &SecurityPolicy, name: &str) -> bool {
         let denied = policy
             .excluded_tools
@@ -1108,9 +999,6 @@ impl DelegateTool {
         self.workspace_dir.join("delegate_results")
     }
 
-    /// Persist a background result atomically: write to a sibling temp file then
-    /// rename onto the final path, so a concurrent reader never observes a
-    /// half-written (or zero-length) JSON document.
     async fn write_result_atomic(
         result_path: &Path,
         result: &BackgroundDelegateResult,
@@ -1341,13 +1229,61 @@ impl DelegateTool {
             .await
     }
 
-    /// Execute one foreground delegate call after selecting the admission mode.
-    ///
-    /// `Required` is the public tool entry path. `Prevalidated` is reserved for
-    /// detached background workers that already performed caller-side admission
-    /// before returning a task id. Keeping the switch at this boundary prevents
-    /// sync/background/agentic variants from each inventing a different bypass.
     async fn execute_sync_with_admission(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+        admission: DelegateAdmission,
+    ) -> anyhow::Result<ToolResult> {
+        // Keep target recovery metadata local: the parent channel scope belongs to its own model call.
+        let (result, fallback) = zeroclaw_providers::reliable::scope_provider_fallback(async {
+            let result = self
+                .execute_sync_with_admission_inner(agent_name, prompt, args, admission)
+                .await;
+            let fallback = zeroclaw_providers::reliable::take_last_provider_fallback_attribution();
+            (result, fallback)
+        })
+        .await;
+
+        let mut result = result?;
+        if result.success
+            && let Some(fallback) = fallback
+        {
+            let agentic = self
+                .agents
+                .get(agent_name)
+                .is_some_and(|config| self.resolve_agentic(&config.runtime_profile));
+            let warning =
+                crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+            let header_key = if agentic {
+                "delegate-provider-fallback-header-agentic"
+            } else {
+                "delegate-provider-fallback-header"
+            };
+            let header = crate::i18n::get_required_cli_string_with_args(
+                header_key,
+                &[
+                    ("agent", agent_name),
+                    ("requested_provider", &fallback.requested_candidate),
+                    ("requested_model", &fallback.fallback.requested_model),
+                    ("actual_provider", &fallback.actual_candidate),
+                    ("actual_model", &fallback.fallback.actual_model),
+                ],
+            );
+            // Successful delegate results are always headed by one generated line. Re-rendering
+            // it here keeps the caller-visible provenance accurate without exposing rejected
+            // provider diagnostics, endpoints, or credentials.
+            let rendered = result
+                .output
+                .split_once('\n')
+                .map_or(result.output.as_str(), |(_, rendered)| rendered);
+            result.output = format!("{header}\n{rendered}\n\n{warning}").into();
+        }
+        Ok(result)
+    }
+
+    async fn execute_sync_with_admission_inner(
         &self,
         agent_name: &str,
         prompt: &str,
@@ -1383,7 +1319,7 @@ impl DelegateTool {
 
         // Resolve profile references
         let max_depth = self.resolve_max_depth(&agent_config.runtime_profile);
-        let (provider_type, credential, model, temperature) =
+        let (legacy_provider_type, credential, _, temperature) =
             self.resolve_brain(&agent_config.model_provider);
         let agentic = self.resolve_agentic(&agent_config.runtime_profile);
 
@@ -1426,18 +1362,18 @@ impl DelegateTool {
         }
 
         // Create model_provider for this agent
-        let model_provider: Box<dyn ModelProvider> = match self.build_target_provider(
+        let (model_provider, provider_type, model) = match self.build_target_provider(
             &agent_config.model_provider,
-            &provider_type,
+            &legacy_provider_type,
             credential.as_deref(),
         ) {
-            Ok(p) => p,
+            Ok(provider) => provider,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!(
-                        "Failed to create model_provider '{provider_type}' for agent '{agent_name}': {e}"
+                        "Failed to create model_provider '{legacy_provider_type}' for agent '{agent_name}': {e}"
                     )),
                 });
             }
@@ -1502,26 +1438,41 @@ impl DelegateTool {
             }
         };
 
-        match result {
-            Ok(response) => {
-                let mut rendered = response;
-                if rendered.trim().is_empty() {
-                    rendered = "[Empty response]".to_string();
-                }
+        Ok(Self::render_non_agentic_result(
+            agent_name,
+            &provider_type,
+            &model,
+            result,
+        ))
+    }
 
-                Ok(ToolResult {
-                    success: true,
-                    output:
-                        format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{rendered}",)
-                            .into(),
-                    error: None,
-                })
+    fn render_non_agentic_result(
+        agent_name: &str,
+        provider_type: &str,
+        model: &str,
+        result: anyhow::Result<String>,
+    ) -> ToolResult {
+        match result {
+            Ok(response)
+                if zeroclaw_api::model_provider::strip_think_tags(&response).is_empty() =>
+            {
+                ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(invalid_semantic_completion_error(agent_name)),
+                }
             }
-            Err(e) => Ok(ToolResult {
+            Ok(response) => ToolResult {
+                success: true,
+                output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{response}",)
+                    .into(),
+                error: None,
+            },
+            Err(e) => ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}",)),
-            }),
+                error: Some(delegate_failure_error(agent_name, &e)),
+            },
         }
     }
 }
@@ -1696,14 +1647,11 @@ impl DelegateTool {
         let runtime_profiles = Arc::clone(&self.runtime_profiles);
         let skill_bundles = Arc::clone(&self.skill_bundles);
         let root_config = self.root_config.clone();
+        // Carried, not dropped: the background task rebuilds a DelegateTool that
+        // will construct its own nested registries.
+        let live_config = self.live_config.clone();
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
-        // Capture the parent loop's session-key task-local so the
-        // detached background task scopes its tool calls under the
-        // same key — channel tools (sessions_send, etc.) need the
-        // session key in scope to attribute correctly. Without this
-        // wrap, the spawned task would lose the parent's task-local
-        // and channel-scoped tool calls would land unattributed.
         let parent_session_key = current_tool_loop_session_key();
         let __zc_delegate_alias = agent_name_owned.clone();
 
@@ -1727,6 +1675,7 @@ impl DelegateTool {
                     runtime_profiles,
                     skill_bundles,
                     root_config,
+                    live_config,
                     caller_alias,
                 };
 
@@ -1791,11 +1740,6 @@ impl DelegateTool {
                 let result_path = results_dir.join(format!("{}.json", task_id_clone));
                 let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
 
-                // EPIC-A supervision: mirror the terminal state into the control-plane so
-                // the registry reflects the real outcome (and the reaper never reclaims a
-                // finished task). No-op when the plane is absent. The store's
-                // terminal-state guard makes a late write after a reaper TimedOut a safe
-                // no-op.
                 if let Some(cp) = crate::control_plane::control_plane() {
                     let cp_status = match final_result.status {
                         BackgroundTaskStatus::Completed => {
@@ -1923,13 +1867,6 @@ impl DelegateTool {
             }
         }
 
-        // Capture the current receipt scope so each spawned sub-agent task
-        // re-enters it. Spawned tasks do not propagate task-locals, so
-        // without this `execute_sync`'s `try_with` would resolve to `None`
-        // inside the spawn and the parallel agents would run unsigned even
-        // when the parent turn has receipts enabled. The collector is `Arc`'d
-        // inside `ReceiptScope`, so all parallel agents push into the same
-        // per-turn collector the orchestrator renders after the loop returns.
         let parent_receipt_scope = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
             .try_with(Clone::clone)
             .ok()
@@ -1962,6 +1899,9 @@ impl DelegateTool {
             let skill_bundles = Arc::clone(&self.skill_bundles);
             let receipt_scope = parent_receipt_scope.clone();
             let root_config = self.root_config.clone();
+            // Carried, not dropped: each fan-out task rebuilds a DelegateTool
+            // that will construct its own nested registries.
+            let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
             let memory = self.memory.clone();
@@ -1987,18 +1927,13 @@ impl DelegateTool {
                         runtime_profiles,
                         skill_bundles,
                         root_config,
+                        live_config,
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
                     let result = scope_delegate_session_key(session_key, async move {
                         crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                             .scope(receipt_scope, async move {
-                                // Parallel workers still carry the caller's
-                                // security policy, not a pre-resolved target
-                                // policy. Let each worker run normal admission
-                                // so the target policy is rebuilt for its own
-                                // agentic loop; the preflight above only
-                                // prevents partial fan-out.
                                 Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
                                     .await
                             })
@@ -2062,12 +1997,6 @@ impl DelegateTool {
 
     // ── Result Retrieval ────────────────────────────────────────────
 
-    /// When a background task's flat-file status still reads `Running` but the durable
-    /// control-plane has reconciled it to a terminal-loss state — the owning daemon died
-    /// (`Lost`) or it exceeded its runtime (`TimedOut`) — return the loss label so result
-    /// readers surface the truth instead of a task that will never finish. `None` when
-    /// there is no loss to report: the control-plane is absent, has no record, or the
-    /// flat file is already authoritative (the task wrote its own terminal state).
     async fn reconciled_loss_label(
         task_id: &str,
         file_status: &BackgroundTaskStatus,
@@ -2366,12 +2295,6 @@ impl DelegateTool {
         })
     }
 
-    /// Live cancellation tokens for in-flight background delegate tasks, keyed by task_id.
-    /// `execute_background` registers a task's child token here before the detached spawn
-    /// and removes it when the task settles; `cancel_task` looks it up to ACTUALLY abort
-    /// the run. (The prior implementation only marked the result file, so a "cancelled"
-    /// task kept running.) Process-global because a background task outlives the tool
-    /// instance that spawned it.
     fn background_task_cancels() -> &'static parking_lot::Mutex<HashMap<String, CancellationToken>>
     {
         static M: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, CancellationToken>>> =
@@ -2484,18 +2407,6 @@ impl DelegateTool {
         self.cancellation_token.cancel();
     }
 
-    /// Compose an independent sub-agent's system prompt from the base (tools /
-    /// skills / identity) prompt and the target's deferred-MCP section.
-    ///
-    /// This mirrors a fresh target turn: the deferred-tools section is first run
-    /// through the turn engine's `apply_text_tool_prompt_policy`, which *clears*
-    /// it for a non-native, strict-tool-parsing target (such a target cannot use
-    /// the text `tool_search` protocol, so a fresh turn never advertises it). Only
-    /// then is a non-empty section appended. Reusing the shared policy helper keeps
-    /// the delegate path from drifting from the engine. The throwaway tool-descs
-    /// vec is intentionally unused - `build_enriched_system_prompt` already applied
-    /// the policy to the tool descriptions; here we only want its effect on the
-    /// deferred section.
     fn compose_independent_system_prompt(
         base: Option<String>,
         mut deferred_section: String,
@@ -2522,12 +2433,6 @@ impl DelegateTool {
         }
     }
 
-    /// Build an enriched system prompt for a sub-agent by composing structured
-    /// operational sections (tools, skills, workspace, datetime, shell policy)
-    /// with the per-agent identity files loaded from the target's own
-    /// workspace dir (`<install>/agents/<alias>/workspace/AGENTS.md`,
-    /// `SOUL.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`, `BOOTSTRAP.md`,
-    /// `MEMORY.md`).
     fn build_enriched_system_prompt(
         &self,
         agent_alias: &str,
@@ -2538,13 +2443,10 @@ impl DelegateTool {
         sends_native_tool_specs: bool,
         skills_override: Option<&[crate::skills::Skill]>,
     ) -> Option<String> {
-        // Skills for the prompt. An independent delegate passes the canonical
-        // per-agent skill set (`skills_override`) - the SAME set its skill tools
-        // were assembled from - so the SkillsSection describes exactly the exposed
-        // tools. Bounded delegation (override None) falls back to local bundle
-        // resolution: with configured bundles, load + concat from each; otherwise
-        // the workspace default. (The local resolver only sees `skill_bundles`,
-        // which is why independent delegation overrides it.)
+        let mut resolved_agent_config = agent_config.clone();
+        resolved_agent_config.resolved = self.resolve_loop_runtime(agent_alias, agent_config);
+        let agent_config = &resolved_agent_config;
+
         let resolved_skills: Vec<crate::skills::Skill>;
         let skills: &[crate::skills::Skill] = match skills_override {
             Some(s) => s,
@@ -2569,8 +2471,6 @@ impl DelegateTool {
             }
         };
 
-        // Determine shell policy instructions when the `shell` tool is in the
-        // effective tool list.
         let empty_tools: &[Box<dyn Tool>] = &[];
         let expose_text_tools =
             sends_native_tool_specs || !agent_config.resolved.strict_tool_parsing;
@@ -2579,53 +2479,41 @@ impl DelegateTool {
         } else {
             empty_tools
         };
-        let has_shell = prompt_tools.iter().any(|t| t.name() == "shell");
-        let shell_policy = if has_shell {
-            "## Shell Policy\n\n\
-             - Prefer non-destructive commands. Use `trash` over `rm` where possible.\n\
-             - Do not run commands that exfiltrate data or modify system-critical paths.\n\
-             - Avoid interactive commands that block on stdin.\n\
-             - Quote paths that may contain spaces."
-                .to_string()
-        } else {
-            String::new()
-        };
+
+        let shell_profile = self.runtime.as_ref().and_then(|r| r.shell_profile());
 
         // Build structured operational context using SystemPromptBuilder sections.
+        let dispatcher_instructions = if sends_native_tool_specs || prompt_tools.is_empty() {
+            String::new()
+        } else {
+            XmlToolDispatcher.prompt_instructions(prompt_tools)
+        };
         let ctx = PromptContext {
             workspace_dir,
             agent_workspace_dir: workspace_dir,
             model_name,
             tools: prompt_tools,
             skills,
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            skills_prompt_mode: agent_config.resolved.prompt_injection_mode,
             identity_config: None,
-            dispatcher_instructions: "",
+            dispatcher_instructions: &dispatcher_instructions,
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
-
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
+            shell_profile,
         };
 
         let builder = SystemPromptBuilder::default()
             .add_section(Box::new(crate::agent::prompt::ToolsSection))
             .add_section(Box::new(crate::agent::prompt::SafetySection))
+            .add_section(Box::new(crate::agent::prompt::ShellSection))
             .add_section(Box::new(crate::agent::prompt::SkillsSection))
             .add_section(Box::new(crate::agent::prompt::WorkspaceSection))
+            .add_section(Box::new(crate::agent::prompt::RuntimeSection))
             .add_section(Box::new(crate::agent::prompt::DateTimeSection));
 
         let mut enriched = builder.build(&ctx).unwrap_or_default();
 
-        if !shell_policy.is_empty() {
-            enriched.push_str(&shell_policy);
-            enriched.push_str("\n\n");
-        }
-
-        // Append the per-agent identity files from the target
-        // sub-agent's own workspace dir. Each missing file is silently
-        // skipped — the operator may not have authored every file.
-        // Skipped entirely when no `root_config` is attached (legacy
-        // unit-test constructors); production paths always attach it.
         if let Some(target_workspace) = self.agent_workspace(agent_alias) {
             let identity_files = [
                 "AGENTS.md",
@@ -2711,11 +2599,6 @@ impl DelegateTool {
                     });
                 }
             },
-            // Background delegation performs the caller-side authorization before it
-            // returns a task id. The detached worker then runs with the resolved target
-            // policy in `self.security`; re-checking `policy_for_target` here would ask
-            // whether the child is allowed to delegate to itself, which is a different
-            // question and rejects legitimate background delegates after acceptance.
             DelegateAdmission::Prevalidated => Arc::clone(&self.security),
         };
         let target_mode = self.mode_for_target(agent_name);
@@ -2805,8 +2688,24 @@ impl DelegateTool {
         };
 
         let loop_runtime = self.resolve_loop_runtime(agent_name, agent_config);
-        let mut prompt_agent_config = agent_config.clone();
-        prompt_agent_config.resolved = loop_runtime.clone();
+        let native_tools = model_provider
+            .capabilities_for_model(model)
+            .native_tool_calling;
+
+        // Independent delegates execute as target-owned turns, so their thinking policy
+        // must override the parent task-local scope for the child loop. Bounded delegates
+        // deliberately retain the caller's turn context.
+        let thinking_params = (target_mode == DelegateExecutionMode::Independent).then(|| {
+            crate::agent::thinking::apply_thinking_level_with_config(
+                loop_runtime.thinking.default_level,
+                &loop_runtime.thinking,
+            )
+        });
+        let effective_temperature = thinking_params.as_ref().map_or(temperature, |params| {
+            temperature.map(|value| {
+                crate::agent::thinking::clamp_temperature(value + params.temperature_adjustment)
+            })
+        });
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
@@ -2815,11 +2714,11 @@ impl DelegateTool {
         let prompt_workspace = sub_workspace.as_deref().unwrap_or(&self.workspace_dir);
         let enriched_system_prompt = self.build_enriched_system_prompt(
             agent_name,
-            &prompt_agent_config,
+            agent_config,
             model,
             &sub_tools,
             prompt_workspace,
-            model_provider.supports_native_tools(),
+            native_tools,
             sub_skills.as_deref(),
         );
         // Independent delegates surface the target's deferred MCP tools the way a fresh
@@ -2829,9 +2728,19 @@ impl DelegateTool {
         let enriched_system_prompt = Self::compose_independent_system_prompt(
             enriched_system_prompt,
             sub_deferred_section,
-            model_provider.supports_native_tools(),
+            native_tools,
             loop_runtime.strict_tool_parsing,
         );
+        let enriched_system_prompt = match (
+            enriched_system_prompt,
+            thinking_params
+                .as_ref()
+                .and_then(|params| params.system_prompt_prefix.as_deref()),
+        ) {
+            (Some(prompt), Some(prefix)) => Some(format!("{prefix}\n\n{prompt}")),
+            (None, Some(prefix)) => Some(prefix.to_string()),
+            (prompt, None) => prompt,
+        };
 
         let mut history = Vec::new();
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
@@ -2844,11 +2753,6 @@ impl DelegateTool {
         let agentic_timeout_secs = self
             .resolve_agentic_timeout_secs(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.agentic_timeout_secs);
-        // Forward the per-turn receipt scope from the parent loop so subagent
-        // tool calls land in the same collector as the top-level turn. When
-        // receipts are disabled (or no scope is set, e.g. CLI / background
-        // delegate spawn) this resolves to `None` and the sub-loop runs
-        // unsigned, matching the parent.
         let receipt_scope = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
             .try_with(Clone::clone)
             .ok()
@@ -2856,15 +2760,18 @@ impl DelegateTool {
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let result = tokio::time::timeout(
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let loop_knobs = LoopKnobs::default();
+        let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
+                sop_reassembly: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider,
                         provider_name: provider_type,
                         model,
-                        temperature,
+                        temperature: effective_temperature,
                     },
                     ResolvedIo {
                         tools_registry: &sub_tools,
@@ -2872,6 +2779,12 @@ impl DelegateTool {
                         silent: true,
                         approval: None,
                         multimodal_config: &self.multimodal_config,
+                        // Full config so the delegated sub-agent's vision route
+                        // resolves the configured `vision_model_provider`'s alias
+                        // options (the `vision` override, endpoint URI, credentials),
+                        // exactly as the parent turn does. `None` only on the
+                        // configless test builder (`root_config` unset).
+                        config: self.root_config.as_deref(),
                         hooks: None,
                         // Thread the target's deferred-MCP activated set so `tool_search`
                         // can activate the target's deferred tools mid-turn (Some only for
@@ -2885,14 +2798,14 @@ impl DelegateTool {
                         max_tool_iterations: loop_runtime.max_tool_iterations,
                         excluded_tools: &[],
                         dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        pacing: &pacing,
                         strict_tool_parsing: loop_runtime.strict_tool_parsing,
                         parallel_tools: loop_runtime.parallel_tools,
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
                         // Keep delegate subagent context pruning aligned with top-level
                         // agents instead of preserving the old disabled-by-zero path.
                         context_token_budget: loop_runtime.max_context_tokens,
-                        knobs: &LoopKnobs::default(),
+                        knobs: &loop_knobs,
                     },
                 ),
                 history: &mut history,
@@ -2908,40 +2821,45 @@ impl DelegateTool {
                 steering: None,
                 new_messages_out: None,
                 image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Real per-transport
-                // stamping is PR C (RFC #6971 §4).
+                // Phase 1: stamp Internal/Trusted. Per-transport
+                // stamping lands in a later phase.
                 memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias: Some(agent_name),
+                parent_agent_alias: None,
                 turn_id: &turn_id,
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
             )),
-        )
-        .await;
+        );
+        let result = match thinking_params {
+            Some(params) => {
+                zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .scope(params.native_thinking, execution)
+                    .await
+            }
+            None => execution.await,
+        };
 
         match result {
-            Ok(Ok(response)) => {
-                let rendered = if response.trim().is_empty() {
-                    "[Empty response]".to_string()
-                } else {
-                    response
-                };
-
-                Ok(ToolResult {
-                    success: true,
-                    output: format!(
-                        "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{rendered}",
-                    )
-                    .into(),
-                    error: None,
-                })
-            }
+            Ok(Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(invalid_semantic_completion_error(agent_name)),
+            }),
+            Ok(Ok(response)) => Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{response}",
+                )
+                .into(),
+                error: None,
+            }),
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}")),
+                error: Some(delegate_failure_error(agent_name, &e)),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -2995,6 +2913,13 @@ impl Tool for ToolArcRef {
         self.inner.param_domains()
     }
 
+    // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
+    // schemas; the trait default would rebuild the spec from
+    // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        self.inner.spec()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }
@@ -3025,10 +2950,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use tokio::time::{Instant, sleep};
+    use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
     use zeroclaw_config::schema::{
         Config, CustomModelProviderConfig, DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
         DEFAULT_DELEGATE_TIMEOUT_SECS, DelegateExecutionMode, DelegateTargetConfig,
-        ModelProviderConfig,
+        ModelProviderConfig, ModelRouteConfig,
     };
     use zeroclaw_memory::{AgentScopedMemory, SqliteMemory};
     use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
@@ -3170,10 +3096,6 @@ mod tests {
             "delegate-test-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -3184,6 +3106,10 @@ mod tests {
 
         fn supports_long_running(&self) -> bool {
             false
+        }
+
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            crate::platform::ShellDialect::Posix
         }
 
         fn build_shell_command(
@@ -3886,6 +3812,16 @@ mod tests {
         buf
     }
 
+    fn http_request_json(request: &[u8]) -> serde_json::Value {
+        let body_start = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("captured HTTP request has a header terminator");
+        serde_json::from_slice(&request[body_start..])
+            .expect("captured HTTP request body is valid JSON")
+    }
+
     async fn write_json_response(socket: &mut tokio::net::TcpStream, body: serde_json::Value) {
         use tokio::io::AsyncWriteExt;
 
@@ -3896,6 +3832,148 @@ mod tests {
             body
         );
         socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn start_failing_chat_server(
+        status: u16,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        start_failing_chat_server_with_error(status, "synthetic primary failure").await
+    }
+
+    async fn start_failing_chat_server_with_error(
+        status: u16,
+        error_message: &'static str,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = format!(r#"{{"error":{{"message":"{error_message}"}}}}"#);
+            let response = format!(
+                "HTTP/1.1 {status} Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn start_primary_failure_then_final_chat_server()
+    -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut first_socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut first_socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = r#"{"error":{"message":"synthetic primary failure"}}"#;
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            first_socket.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut second_socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut second_socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            write_json_response(
+                &mut second_socket,
+                serde_json::json!({
+                    "choices": [{"message": {"content": "final primary reply"}}]
+                }),
+            )
+            .await;
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn start_tool_call_chat_server() -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            write_json_response(
+                &mut socket,
+                chat_completion_tool_call(
+                    "echo_tool",
+                    "fallback_tool",
+                    serde_json::json!({"value": "ping"}),
+                ),
+            )
+            .await;
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn start_text_tool_then_final_chat_server() -> (
+        LocalChatServer,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let request_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_bodies = Arc::clone(&request_bodies);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let responses = [
+                serde_json::json!({
+                    "choices": [{"message": {"content": "<tool_call>{\"name\":\"echo_tool\",\"arguments\":{\"value\":\"fallback\"}}</tool_call>"}}]
+                }),
+                serde_json::json!({
+                    "choices": [{"message": {"content": "fallback final reply"}}]
+                }),
+            ];
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                captured_bodies.lock().unwrap().push(request);
+                write_json_response(&mut socket, response).await;
+            }
+        });
+
+        (
+            LocalChatServer { uri, _task: task },
+            requests,
+            request_bodies,
+        )
+    }
+
+    async fn start_slow_chat_server(
+        delay: Duration,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
     }
 
     async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {
@@ -4471,7 +4549,7 @@ mod tests {
     #[tokio::test]
     async fn agentic_mode_empty_allowed_tools_inherits_caller_registry() {
         // Empty allowed_tools now means "inherit": the target runs with the
-        // caller's already-filtered tools instead of being rejected (#7470).
+        // caller's already-filtered tools instead of being rejected
         let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_runtime_profiles(agentic_runtime_profiles(10))
@@ -4727,6 +4805,48 @@ mod tests {
                 .contains("memory workflow done")
         );
         assert_stored_for_target_only(&fixture, "background-key").await;
+    }
+
+    #[tokio::test]
+    async fn background_agentic_delegate_persists_localized_semantic_empty_error() {
+        // The configured Reliable wrapper retries a semantic-empty completion
+        // twice before terminal delivery. Supply one empty response per
+        // attempt so this boundary test proves the final semantic-empty cause,
+        // not a connection error after the fixture exhausts its responses.
+        let server = start_final_chat_server(vec!["", "", ""]).await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "return a final answer",
+                "background": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "background task should start: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .expect("background task id")
+            .trim_start_matches("task_id: ")
+            .trim();
+        let background = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+
+        assert_eq!(
+            background.status,
+            BackgroundTaskStatus::Failed,
+            "{background:?}"
+        );
+        assert!(background.output.is_none(), "{background:?}");
+        assert_eq!(
+            background.error.as_deref(),
+            Some(invalid_semantic_completion_error("target").as_str()),
+            "{background:?}"
+        );
     }
 
     #[tokio::test]
@@ -5063,7 +5183,7 @@ mod tests {
                 test_security(),
             ))])));
 
-        let model_provider = OneToolThenFinalModelProvider;
+        let model_provider = ToolCountModelProvider { expected_tools: 0 };
         let result = tool
             .execute_agentic(
                 "agentic",
@@ -5151,14 +5271,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_agentic_delegate_rejects_empty_terminal_completion() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Ok(" \n\t".to_string()),
+        );
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("delegate"));
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_rejects_think_only_terminal_completion() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Ok("<think>internal reasoning</think>".to_string()),
+        );
+
+        assert!(!result.success, "think-only terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("delegate"));
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_projects_typed_terminal_failure() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            )),
+        );
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        let expected = invalid_semantic_completion_error("delegate");
+        assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rejects_empty_terminal_completion() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "test-provider",
+                "test-model",
+                &EmptyTerminalModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .expect("delegate returns a failed tool result rather than an error");
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("agentic"));
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rejects_empty_completion_after_tool_result() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "test-provider",
+                "test-model",
+                &ToolThenEmptyTerminalModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .expect("delegate returns a failed tool result rather than an error");
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("invalid semantic completion"), "{error}");
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
     async fn execute_agentic_forwards_receipt_scope_into_subagent_loop() {
-        // Receipt forwarding through the delegate sub-loop is the activation
-        // pass for #6182's delegate.rs:1184 acceptance criterion. With
-        // `TOOL_LOOP_RECEIPT_CONTEXT` scoped, every sub-tool call inside the
-        // delegate must produce a receipt that lands in the same per-turn
-        // collector the parent passed in. Without the task-local read in
-        // `execute_sync` this test fails: the collector stays empty because
-        // the sub-loop runs unsigned with `None, None` for the receipt args.
         use crate::agent::tool_receipts::{
             ReceiptGenerator, ReceiptScope, TOOL_LOOP_RECEIPT_CONTEXT,
         };
@@ -5382,6 +5611,10 @@ mod tests {
 
     struct FinalOnlyModelProvider;
 
+    struct EmptyTerminalModelProvider;
+
+    struct ToolThenEmptyTerminalModelProvider;
+
     #[async_trait]
     impl ModelProvider for FinalOnlyModelProvider {
         async fn chat_with_system(
@@ -5418,6 +5651,108 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "FinalOnlyModelProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for EmptyTerminalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: Some("reasoning only".to_string()),
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EmptyTerminalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "EmptyTerminalModelProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolThenEmptyTerminalModelProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if request
+                .messages
+                .iter()
+                .any(|message| message.role == "tool")
+            {
+                return Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: Some("reasoning only".to_string()),
+                });
+            }
+
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "echo_tool".to_string(),
+                    arguments: "{\"value\":\"ping\"}".to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ToolThenEmptyTerminalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ToolThenEmptyTerminalModelProvider"
         }
     }
 
@@ -5475,6 +5810,282 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RecordedThinkingRequest {
+        thinking_budget: Option<u32>,
+        system_prompt: Option<String>,
+        temperature: Option<f64>,
+    }
+
+    #[derive(Default)]
+    struct ThinkingRecordingModelProvider {
+        requests: std::sync::Mutex<Vec<RecordedThinkingRequest>>,
+    }
+
+    impl ThinkingRecordingModelProvider {
+        fn request(&self) -> RecordedThinkingRequest {
+            let mut requests = self.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "expected exactly one provider request");
+            requests.pop().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ThinkingRecordingModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("tool loop must use ChatRequest")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let thinking_budget = request.thinking.map(|params| params.budget_tokens);
+            let system_prompt = request
+                .messages
+                .iter()
+                .find(|message| message.role == "system")
+                .map(|message| message.content.clone());
+            self.requests.lock().unwrap().push(RecordedThinkingRequest {
+                thinking_budget,
+                system_prompt,
+                temperature,
+            });
+            Ok(ChatResponse {
+                text: Some("delegate complete".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ThinkingRecordingModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ThinkingRecordingModelProvider"
+        }
+    }
+
+    fn thinking_delegate_fixture(
+        mode: DelegateExecutionMode,
+        thinking: ThinkingConfig,
+    ) -> (DelegateTool, AliasedAgentConfig) {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "target-runtime".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                thinking,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "custom.unused".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let target = AliasedAgentConfig {
+            risk_profile: "target".into(),
+            runtime_profile: "target-runtime".into(),
+            model_provider: "custom.unused".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("target".to_string(), target.clone());
+
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
+        (tool, target)
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_uses_target_native_thinking_and_restores_parent_scope() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                assert_eq!(
+                    zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .unwrap(),
+                    parent,
+                    "the target scope must not leak into the parent turn"
+                );
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, Some(50_000));
+        assert!(
+            request
+                .temperature
+                .is_some_and(|temperature| (temperature - 0.3).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_prepends_target_non_native_thinking_prompt() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: false,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                assert_eq!(
+                    zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .unwrap(),
+                    parent,
+                    "a non-native target must clear the override only inside its child scope"
+                );
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, None);
+        assert!(
+            request
+                .system_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.starts_with("Think very carefully and exhaustively.")),
+            "target thinking prefix must precede the delegated system prompt: {request:?}"
+        );
+        assert!(
+            request
+                .temperature
+                .is_some_and(|temperature| (temperature - 0.3).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_retains_parent_thinking_scope() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Bounded, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, Some(10_000));
+        assert_eq!(request.temperature, Some(0.2));
+    }
+
     #[tokio::test]
     async fn mcp_tools_included_in_subagent_tool_list() {
         // Build DelegateTool with NO parent tools initially
@@ -5510,14 +6121,6 @@ mod tests {
         );
     }
 
-    /// PR #7547 review (Audacity88): the `<server>__<tool>` MCP-naming
-    /// convention must be auto-admitted by the delegate filter even when
-    /// the risk profile's explicit `allowed_tools` list does not mention
-    /// the tool. The pre-existing `mcp_tools_included_in_subagent_tool_list`
-    /// fixture uses `mcp_fake` (no double underscore) so it exercises the
-    /// explicit allow-list path, not the new auto-admit branch. This test
-    /// pins the new branch via the resolve_tool_policy + delegate_admits_with_mcp
-    /// pair that replaces the pre-#7608 resolve_allowed_tools helper.
     #[test]
     fn delegate_admits_with_mcp_auto_admits_double_underscore_mcp_names() {
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
@@ -5547,13 +6150,6 @@ mod tests {
         );
     }
 
-    /// Characterization test for the MCP resource/prompt capability tools'
-    /// subagent-propagation guarantee (issue #4467). `mcp_resources` and
-    /// `mcp_prompts` contain no `__`, so they are NOT auto-admitted the way
-    /// runtime `<server>__<tool>` MCP wrappers are: a narrowed `caller_allowed`
-    /// list that omits them must exclude them. This locks the boundary so a
-    /// narrowed delegate/spawn_subagent cannot reach resources/prompts unless
-    /// explicitly granted.
     #[test]
     fn caller_allowed_narrowing_excludes_mcp_capability_tools() {
         use zeroclaw_tools::tool_search::ToolAccessPolicy;
@@ -5568,12 +6164,6 @@ mod tests {
         assert!(!policy.is_tool_allowed("mcp_prompts"));
     }
 
-    /// PR #7547 review (Audacity88) — blocking comment: the PR body
-    /// claims MCP tools can still be blocked via `excluded_tools`. A
-    /// target profile that allow-lists `shell` and excludes
-    /// `filesystem__write_file` must NOT receive the MCP wrapper in an
-    /// agentic delegate even though it matches the `__` auto-admit
-    /// heuristic.
     #[test]
     fn delegate_admits_with_mcp_honors_excluded_tools_for_auto_admitted_mcp() {
         let mut profiles = HashMap::new();
@@ -5604,11 +6194,6 @@ mod tests {
         );
     }
 
-    /// Companion to the test above: `excluded_tools` must also subtract
-    /// from explicit allow-list entries, not just from the
-    /// double-underscore auto-admit set. delegate.rs previously ignored
-    /// `excluded_tools` entirely on the agentic path; this pins the fix
-    /// so it cannot regress.
     #[test]
     fn delegate_admits_with_mcp_honors_excluded_tools_for_explicit_allow_list_entries() {
         let mut profiles = HashMap::new();
@@ -5758,13 +6343,62 @@ mod tests {
         assert!(!prompt.contains("CURRENT DATE & TIME"));
         assert!(!prompt.contains("Time:"));
         assert!(!prompt.contains("ISO 8601:"));
-        // Identity files come from the target sub-agent's per-agent
-        // workspace dir. The test's install_root is unset, so no
-        // identity files exist for the dummy alias — the prompt still
-        // contains the structural sections verified above, which is
-        // the load-bearing assertion.
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn enriched_prompt_resolves_explicit_global_full_skill_mode() {
+        let mut root_config = Config::default();
+        root_config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        root_config
+            .agents
+            .insert("alpha".into(), AliasedAgentConfig::default());
+        let root_config = Arc::new(root_config);
+        let config = root_config.agents.get("alpha").unwrap().clone();
+        let workspace = std::env::temp_dir();
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run <smoke> & release checks.".into()],
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+
+        let tool = DelegateTool::new(root_config.agents.clone(), None, test_security())
+            .with_root_config(root_config)
+            .with_workspace_dir(workspace.to_path_buf());
+        assert_eq!(
+            tool.resolve_loop_runtime("alpha", &config)
+                .prompt_injection_mode,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+        );
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                Some(&skills),
+            )
+            .unwrap();
+
+        assert!(prompt.contains("<instructions>"));
+        assert!(
+            prompt.contains("<instruction>Run &lt;smoke&gt; &amp; release checks.</instruction>")
+        );
+        assert!(!prompt.contains("read_skill"));
+        assert!(!prompt.contains("loaded on demand"));
     }
 
     #[test]
@@ -5802,11 +6436,40 @@ mod tests {
             }
         }
 
+        struct PosixRuntime;
+        impl crate::platform::RuntimeAdapter for PosixRuntime {
+            fn name(&self) -> &str {
+                "posix-test"
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
+            fn shell_dialect(&self) -> crate::platform::ShellDialect {
+                crate::platform::ShellDialect::Posix
+            }
+            fn build_shell_command(
+                &self,
+                command: &str,
+                workspace_dir: &std::path::Path,
+            ) -> anyhow::Result<tokio::process::Command> {
+                let mut cmd = tokio::process::Command::new("/bin/sh");
+                cmd.args(["-c", command]).current_dir(workspace_dir);
+                Ok(cmd)
+            }
+        }
+
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockShellTool)];
         let workspace = std::env::temp_dir();
 
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_workspace_dir(workspace.to_path_buf());
+            .with_workspace_dir(workspace.to_path_buf())
+            .with_runtime(Arc::new(PosixRuntime));
 
         let prompt = tool
             .build_enriched_system_prompt(
@@ -5821,8 +6484,12 @@ mod tests {
             .unwrap();
 
         assert!(
-            prompt.contains("## Shell Policy"),
-            "should contain shell policy when shell tool is present"
+            prompt.contains("## Shell"),
+            "should contain shell section when shell tool is present"
+        );
+        assert!(
+            !prompt.contains("## Shell Policy"),
+            "static shell policy block must not appear"
         );
     }
 
@@ -5881,6 +6548,112 @@ mod tests {
         assert!(
             !prompt.contains("## Shell Policy"),
             "should not contain shell policy when shell tool is absent"
+        );
+    }
+
+    #[test]
+    fn enriched_prompt_reports_powershell_dialect_for_delegate_with_shell_tool() {
+        let config = AliasedAgentConfig::default();
+
+        struct MockShellTool;
+        impl ::zeroclaw_api::attribution::Attributable for MockShellTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Shell,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
+        #[async_trait]
+        impl Tool for MockShellTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "Execute shell commands"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: ToolOutput::default(),
+                    error: None,
+                })
+            }
+        }
+
+        struct PsRuntime;
+        impl crate::platform::RuntimeAdapter for PsRuntime {
+            fn name(&self) -> &str {
+                "ps-test"
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
+            fn shell_dialect(&self) -> crate::platform::ShellDialect {
+                crate::platform::ShellDialect::PowerShell
+            }
+            fn shell_profile(&self) -> Option<zeroclaw_api::runtime_traits::ShellProfile> {
+                Some(zeroclaw_api::runtime_traits::ShellProfile {
+                    name: "powershell".to_string(),
+                    dialect: crate::platform::ShellDialect::PowerShell,
+                })
+            }
+            fn build_shell_command(
+                &self,
+                command: &str,
+                workspace_dir: &std::path::Path,
+            ) -> anyhow::Result<tokio::process::Command> {
+                let mut cmd = tokio::process::Command::new("powershell");
+                cmd.args(["-Command", command]).current_dir(workspace_dir);
+                Ok(cmd)
+            }
+        }
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockShellTool)];
+        let workspace = std::env::temp_dir();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.to_path_buf())
+            .with_runtime(Arc::new(PsRuntime));
+
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            prompt.contains("Shell: powershell") || prompt.contains("powershell"),
+            "prompt must identify powershell dialect; got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("trash"),
+            "POSIX deletion advice must not appear in a PowerShell delegate prompt"
+        );
+        assert!(
+            prompt.contains("Get-ChildItem") || prompt.contains("Remove-Item"),
+            "PowerShell deletion guidance must appear; got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("## Shell Policy"),
+            "static shell policy block must not appear"
         );
     }
 
@@ -6846,10 +7619,6 @@ mod tests {
     }
 
     fn config_with_always_ask_delegate(mode: DelegateExecutionMode) -> Arc<Config> {
-        // Shared fixture for the temporary `always_ask` block: caller can
-        // delegate to both targets, but only `target` carries a trimmed
-        // always_ask entry. `peer` lets parallel tests prove fan-out fails
-        // before spawning any sibling when one target is blocked.
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{RiskProfileConfig, RuntimeProfileConfig};
 
@@ -7278,13 +8047,6 @@ mod tests {
         );
     }
 
-    /// Regression for issue #7263: when the caller's policy was built
-    /// with a session cwd (the ACP / gateway path), delegating to a
-    /// sibling agent must carry that cwd into the target's policy.
-    /// Without this, the child run's file/shell tools jail to the
-    /// per-agent install dir declared in config rather than the IDE's
-    /// session cwd, breaking delegate-driven workflows in repos
-    /// outside the install root.
     #[tokio::test]
     async fn delegate_target_inherits_caller_session_workspace_dir() {
         let config = config_with_two_agents("caller", 5, "target", 5);
@@ -7732,10 +8494,6 @@ mod tests {
         );
     }
 
-    /// An independent delegate now receives the TARGET agent's callable SKILL tools,
-    /// not just its built-ins -- matching a fresh target turn. A skill declared in the
-    /// target's workspace surfaces as `{skill}__{tool}`. This fails on the old
-    /// `skills: &[]` wiring (the built-in-only registry).
     #[tokio::test]
     async fn independent_delegate_receives_target_skill_tools() {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
@@ -7840,17 +8598,11 @@ command = "echo hi"
             .map(|t| t.name().to_string())
             .collect();
 
-        // The target skill tool reaches the delegate even though the target's allowed_tools
-        // is ["shell"]: skill tools are granted via skill config (skill_bundles/workspace),
-        // NOT the built-in allowlist, and builtin-kind skill tools are scoped-elevation
-        // wrappers meant to stay callable off the allowlist. Only excluded_tools subtracts a
-        // skill tool (see the seam fix in `register_skill_tools`), so this is correct
-        // documented behavior, not an allowlist bypass.
         assert!(
             names.iter().any(|n| n == "pdfify__run"),
             "independent delegate must expose the target's skill tools (fails with skills:&[]); got {names:?}"
         );
-        // The #8239 invariants still hold alongside the new skill tools.
+        // Theinvariants still hold alongside the new skill tools.
         assert!(
             names.iter().any(|n| n == "shell"),
             "target built-in must still be present, got {names:?}"
@@ -8034,63 +8786,717 @@ command = "echo hi"
         );
     }
 
-    #[tokio::test]
-    async fn delegate_builds_target_provider_with_its_declared_wire_api() {
+    fn fallback_delegate_config(
+        primary_uri: String,
+        backup_uri: String,
+        agentic: bool,
+    ) -> (Arc<Config>, TempDir) {
+        fallback_delegate_config_with_native_tools(primary_uri, backup_uri, agentic, None, None)
+    }
+
+    fn fallback_delegate_config_with_native_tools(
+        primary_uri: String,
+        backup_uri: String,
+        agentic: bool,
+        primary_native_tools: Option<bool>,
+        backup_native_tools: Option<bool>,
+    ) -> (Arc<Config>, TempDir) {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig, WireApi,
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
         };
-        let mut config = Config::default();
+
+        let temp_dir = TempDir::new().expect("temporary delegate fixture directory");
+        let mut config = Config {
+            data_dir: temp_dir.path().join("data"),
+            config_path: temp_dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
         config.providers.models.custom.insert(
-            "vllm".to_string(),
+            "primary".to_string(),
             CustomModelProviderConfig {
                 base: ModelProviderConfig {
-                    uri: Some("http://10.0.0.15:8000/v1".to_string()),
-                    model: Some("Qwen3.6-27B".to_string()),
-                    wire_api: Some(WireApi::Responses),
+                    uri: Some(primary_uri),
+                    model: Some("primary-model".to_string()),
+                    native_tools: primary_native_tools,
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "custom.backup",
+                    )],
                     ..ModelProviderConfig::default()
                 },
             },
         );
-        config.agents.insert(
-            "target".to_string(),
-            AliasedAgentConfig {
-                model_provider: "custom.vllm".into(),
-                ..AliasedAgentConfig::default()
+        config.providers.models.custom.insert(
+            "backup".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(backup_uri),
+                    // This deliberately matches the primary model. The two aliases
+                    // still represent distinct configured candidates.
+                    model: Some("primary-model".to_string()),
+                    native_tools: backup_native_tools,
+                    ..ModelProviderConfig::default()
+                },
             },
         );
-        let config = Arc::new(config);
+        config.risk_profiles.insert(
+            "delegating".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "review".to_string(),
+            RuntimeProfileConfig {
+                agentic,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        for agent in ["caller", "target"] {
+            config.agents.insert(
+                agent.to_string(),
+                AliasedAgentConfig {
+                    model_provider: "custom.primary".into(),
+                    risk_profile: "delegating".into(),
+                    runtime_profile: "review".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_root_config(Arc::clone(&config));
+        (Arc::new(config), temp_dir)
+    }
 
-        // Drives the exact build path `run` takes. With root_config + a
-        // dotted model_provider, the alias-aware factory must read the
-        // target's `custom.vllm` entry and honor wire_api = responses.
-        let provider = tool
-            .build_target_provider("custom.vllm", "custom", None)
-            .expect("target provider builds offline");
+    fn fallback_delegate_tool(config: Arc<Config>, workspace_dir: Option<PathBuf>) -> DelegateTool {
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
+
+        match workspace_dir {
+            Some(workspace_dir) => tool.with_workspace_dir(workspace_dir),
+            None => tool,
+        }
+    }
+
+    fn assert_generic_fallback_warning(output: &str, primary_uri: &str) {
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
         assert_eq!(
-            provider.default_wire_api(),
-            "responses",
-            "delegate must build the target with its declared responses wire API"
+            output.matches(&warning).count(),
+            1,
+            "recovered delegate result must include exactly one generic warning: {output:?}"
+        );
+        assert!(
+            !output.contains(primary_uri),
+            "recovered output must not expose the primary endpoint: {output:?}"
+        );
+        assert!(
+            !output.contains("synthetic primary failure"),
+            "recovered output must not expose provider error details: {output:?}"
+        );
+    }
+
+    fn assert_explicit_fallback_attribution(output: &str, agentic: bool) {
+        let header_key = if agentic {
+            "delegate-provider-fallback-header-agentic"
+        } else {
+            "delegate-provider-fallback-header"
+        };
+        let header = crate::i18n::get_required_cli_string_with_args(
+            header_key,
+            &[
+                ("agent", "target"),
+                ("requested_provider", "custom.primary"),
+                ("requested_model", "primary-model"),
+                ("actual_provider", "custom.backup"),
+                // The same model proves this is exact candidate attribution, not a model switch.
+                ("actual_model", "primary-model"),
+            ],
+        );
+        assert_eq!(
+            output.matches(&header).count(),
+            1,
+            "recovered output must identify the requested and served candidates exactly once: \
+             {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_fallback_warning_is_local_to_synchronous_call() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["fallback reply"]).await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"agent": "target", "prompt": "respond"}))
+                    .await
+                    .expect("delegate call completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(result.success, "fallback should recover: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert!(result.output.contains("fallback reply"), "{result:?}");
+        assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert_explicit_fallback_attribution(result.output.as_str(), true);
+        assert!(
+            outer_fallback.is_none(),
+            "delegate fallback must not leak into the parent channel scope: {outer_fallback:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn agentic_delegate_attributes_final_primary_response_after_earlier_fallback() {
+        let (primary, primary_requests) = start_primary_failure_then_final_chat_server().await;
+        let (backup, backup_requests) = start_tool_call_chat_server().await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
+            .await
+            .expect("agentic delegate completes");
+
+        assert!(result.success, "agentic delegate failed: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the primary must be retried on the post-tool model request"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the backup must serve only the tool-call response"
+        );
+        assert!(result.output.contains("final primary reply"), "{result:?}");
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert!(
+            !result.output.contains(&warning),
+            "a final primary response must not carry stale fallback attribution: {result:?}"
+        );
+        assert!(
+            !result.output.contains("custom.backup"),
+            "the final primary response must not be labeled as backup-served: {result:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn agentic_delegate_uses_text_tools_when_only_its_fallback_supports_them() {
+        // The primary advertises native tools but fails. The text-only fallback
+        // must receive the XML protocol and execute its tool, rather than a
+        // native request that it cannot reliably interpret.
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let (backup, backup_requests, backup_bodies) =
+            start_text_tool_then_final_chat_server().await;
+        let (config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            primary.uri.clone(),
+            backup.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let tool = fallback_delegate_tool(config, None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
+            .await
+            .expect("agentic delegate completes");
+
+        assert!(result.success, "agentic delegate failed: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must receive the initial failing request"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the fallback must receive the tool request and the final response request"
+        );
+        assert!(result.output.contains("fallback final reply"), "{result:?}");
+
+        let bodies = backup_bodies.lock().unwrap();
+        let first_request = http_request_json(bodies.first().expect("first fallback request"));
+        assert!(
+            first_request.get("tools").is_none(),
+            "the text-only fallback must not receive native tool specifications: {first_request}"
+        );
+        let system_prompt = first_request["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "system"))
+            .and_then(|message| message["content"].as_str())
+            .expect("fallback request contains a text system prompt");
+        for required in ["## Tool Use Protocol", "<tool_call>", "echo_tool", "value"] {
+            assert!(
+                system_prompt.contains(required),
+                "fallback prompt must contain {required:?}: {system_prompt}"
+            );
+        }
+        assert!(
+            bodies
+                .get(1)
+                .is_some_and(|body| body.windows(13).any(|part| part == b"echo:fallback")),
+            "the second fallback request must contain the executed tool result: {bodies:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn routed_agentic_delegate_uses_selected_models_text_tool_protocol() {
+        let (default, default_requests) = start_failing_chat_server(503).await;
+        let (routed, routed_requests, routed_bodies) =
+            start_text_tool_then_final_chat_server().await;
+        let (fixture_config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            default.uri.clone(),
+            routed.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let mut config = (*fixture_config).clone();
+        let primary = &mut config
+            .providers
+            .models
+            .custom
+            .get_mut("primary")
+            .expect("primary provider")
+            .base;
+        primary.model = Some("hint:text".to_string());
+        primary.fallback.clear();
+        config
+            .providers
+            .models
+            .custom
+            .get_mut("backup")
+            .expect("routed provider")
+            .base
+            .model = Some("routed-model".to_string());
+        config.model_routes.push(ModelRouteConfig {
+            hint: "text".to_string(),
+            model_provider: "custom.backup".to_string(),
+            model: "routed-model".to_string(),
+            api_key: None,
+        });
+        let tool = fallback_delegate_tool(Arc::new(config), None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
+            .await
+            .expect("routed agentic delegate completes");
+
+        assert!(result.success, "routed delegate failed: {result:?}");
+        assert_eq!(
+            default_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the Router default must not receive a hinted request"
+        );
+        assert_eq!(
+            routed_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the selected route must receive both tool-loop requests"
+        );
+        assert!(result.output.contains("fallback final reply"), "{result:?}");
+
+        let bodies = routed_bodies.lock().unwrap();
+        let first_request = http_request_json(bodies.first().expect("first routed request"));
+        assert_eq!(first_request["model"], "routed-model");
+        assert!(
+            first_request.get("tools").is_none(),
+            "the text-only selected route must not receive native tools: {first_request}"
+        );
+        let system_prompt = first_request["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "system"))
+            .and_then(|message| message["content"].as_str())
+            .expect("routed request contains a text system prompt");
+        for required in ["## Tool Use Protocol", "<tool_call>", "echo_tool", "value"] {
+            assert!(
+                system_prompt.contains(required),
+                "routed prompt must contain {required:?}: {system_prompt}"
+            );
+        }
+        assert!(
+            bodies
+                .get(1)
+                .is_some_and(|body| body.windows(13).any(|part| part == b"echo:fallback")),
+            "the second routed request must contain the tool result: {bodies:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn strict_mixed_agentic_delegate_fails_before_provider_dispatch() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let (backup, backup_requests) = start_failing_chat_server(503).await;
+        let (fixture_config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            primary.uri.clone(),
+            backup.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let mut config = (*fixture_config).clone();
+        config
+            .runtime_profiles
+            .get_mut("review")
+            .expect("review runtime profile")
+            .strict_tool_parsing = true;
+        let tool = fallback_delegate_tool(Arc::new(config), None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool"}))
+            .await
+            .expect("delegate returns a terminal tool result");
+
+        assert!(!result.success, "strict mixed chain must fail: {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "terminal failure has no output: {result:?}"
+        );
+        let expected =
+            crate::i18n::get_required_cli_string("turn-tool-protocol-strict-mixed-error");
+        let error = result.error.expect("strict mixed chain returns an error");
+        assert!(error.contains(&expected), "unexpected error: {error}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "strict mixed validation must precede the primary request"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "strict mixed validation must precede fallback dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_preserves_generic_fallback_warning() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["non-agentic fallback reply"]).await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"agent": "target", "prompt": "respond"}))
+                    .await
+                    .expect("delegate call completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(result.success, "fallback should recover: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert!(
+            result.output.contains("non-agentic fallback reply"),
+            "{result:?}"
+        );
+        assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert_explicit_fallback_attribution(result.output.as_str(), false);
+        assert!(
+            outer_fallback.is_none(),
+            "delegate fallback must not leak into the parent channel scope: {outer_fallback:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn background_delegate_persists_generic_fallback_warning() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["background fallback reply"]).await;
+        let workspace = TempDir::new().expect("temporary workspace");
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, Some(workspace.path().to_path_buf()));
+
+        let (start, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let start = tool
+                    .execute(json!({
+                        "agent": "target",
+                        "prompt": "respond",
+                        "background": true,
+                    }))
+                    .await
+                    .expect("background delegate starts");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (start, outer_fallback)
+            })
+            .await;
+
+        assert!(start.success, "background start failed: {start:?}");
+        assert!(
+            outer_fallback.is_none(),
+            "background delegate fallback must not leak into its parent scope: {outer_fallback:?}"
+        );
+        let task_id = start
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("background start includes task id");
+        let result = wait_for_terminal_background_result(workspace.path(), task_id).await;
+
+        assert_eq!(result.status, BackgroundTaskStatus::Completed, "{result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        let output = result.output.as_deref().expect("completed output");
+        assert!(output.contains("background fallback reply"), "{result:?}");
+        assert_generic_fallback_warning(output, &primary.uri);
+        assert_explicit_fallback_attribution(output, true);
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn parallel_delegate_preserves_generic_fallback_warning() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["parallel fallback reply"]).await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"parallel": ["target"], "prompt": "respond"}))
+                    .await
+                    .expect("parallel delegate completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(result.success, "parallel delegate failed: {result:?}");
+        assert!(
+            outer_fallback.is_none(),
+            "parallel delegate fallback must not leak into the parent scope: {outer_fallback:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert!(
+            result.output.contains("parallel fallback reply"),
+            "{result:?}"
+        );
+        assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert_explicit_fallback_attribution(result.output.as_str(), true);
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn delegate_returns_safe_ordered_summary_when_fallbacks_exhaust() {
+        let (primary, primary_requests) =
+            start_failing_chat_server_with_error(503, "primary failure marker").await;
+        let (backup, backup_requests) =
+            start_failing_chat_server_with_error(503, "backup failure marker").await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"agent": "target", "prompt": "respond"}))
+                    .await
+                    .expect("delegate call completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(!result.success, "exhaustion must be terminal: {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "terminal error must not carry output: {result:?}"
+        );
+        assert!(
+            outer_fallback.is_none(),
+            "failed delegation must not leave recovery metadata in the parent scope: {outer_fallback:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the configured fallback must be attempted exactly once"
+        );
+        let error = result.error.expect("terminal delegate error");
+        assert!(
+            error.contains("All model providers/models failed after 2 failure event(s)"),
+            "terminal error summarizes every failure event: {error}"
+        );
+        assert!(
+            error.contains("event 1 (retry 1/1): retryable")
+                && error.contains("event 2 (retry 1/1): retryable"),
+            "summary preserves event order: {error}"
+        );
+        assert!(
+            !error.contains("primary failure marker") && !error.contains("backup failure marker"),
+            "provider-controlled response bodies must not reach the caller: {error}"
+        );
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert!(
+            !error.contains(&warning),
+            "terminal errors must remain errors rather than recovery warnings: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_timeout_stays_distinct_from_provider_exhaustion() {
+        let (primary, _primary_requests) = start_slow_chat_server(Duration::from_secs(2)).await;
+        let (backup, backup_requests) = start_failing_chat_server(503).await;
+        let (fixture_config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false);
+        let mut config = (*fixture_config).clone();
+        config
+            .runtime_profiles
+            .get_mut("review")
+            .expect("review runtime profile")
+            .delegation_timeout_secs = Some(1);
+        let tool = fallback_delegate_tool(Arc::new(config), None);
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "respond"}))
+            .await
+            .expect("delegate call completes");
+
+        assert!(!result.success, "timeout must remain terminal: {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "timeout must not carry output: {result:?}"
+        );
+        let error = result.error.expect("timeout error");
+        assert_eq!(error, "Agent 'target' timed out after 1s");
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "outer timeout must not be converted into fallback exhaustion"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_delegate_persists_safe_summary_when_fallbacks_exhaust() {
+        let (primary, primary_requests) =
+            start_failing_chat_server_with_error(503, "background primary failure marker").await;
+        let (backup, backup_requests) =
+            start_failing_chat_server_with_error(503, "background backup failure marker").await;
+        let workspace = TempDir::new().expect("temporary workspace");
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, Some(workspace.path().to_path_buf()));
+
+        let start = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "respond",
+                "background": true,
+            }))
+            .await
+            .expect("background delegate starts");
+        let task_id = start
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("background start includes task id");
+        let persisted = wait_for_terminal_background_result(workspace.path(), task_id).await;
+
+        assert_eq!(
+            persisted.status,
+            BackgroundTaskStatus::Failed,
+            "{persisted:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the configured fallback must be attempted exactly once"
+        );
+        let persisted_error = persisted
+            .error
+            .as_deref()
+            .expect("persisted failure detail");
+        assert!(
+            persisted_error.contains("All model providers/models failed after 2 failure event(s)")
+                && persisted_error.contains("event 1 (retry 1/1): retryable")
+                && persisted_error.contains("event 2 (retry 1/1): retryable"),
+            "persisted error must contain the safe ordered summary: {persisted_error}"
+        );
+        assert!(
+            !persisted_error.contains("background primary failure marker")
+                && !persisted_error.contains("background backup failure marker"),
+            "provider-controlled response bodies must not persist: {persisted_error}"
         );
 
-        // Regression guard: the pre-fix path (bare factory, no config/alias
-        // context) cannot see the per-alias config — for the custom family it
-        // errors on the missing uri it can't resolve, which is exactly the
-        // "error in the provider" the bug report described. Either way it does
-        // not yield a working responses provider.
-        let stale = zeroclaw_providers::create_model_provider_with_options(
-            "custom",
-            None,
-            &tool.provider_runtime_options,
-        );
-        let stale_is_responses = stale
-            .map(|p| p.default_wire_api() == "responses")
-            .unwrap_or(false);
+        let result = tool
+            .execute(json!({"action": "check_result", "task_id": task_id}))
+            .await
+            .expect("check_result completes");
         assert!(
-            !stale_is_responses,
-            "bare factory must NOT yield a responses provider — proves the alias path is load-bearing"
+            !result.success,
+            "terminal background failure is not success: {result:?}"
+        );
+        let error = result
+            .error
+            .expect("caller receives background failure detail");
+        assert!(
+            error.contains("All model providers/models failed after 2 failure event(s)")
+                && error.contains("event 1 (retry 1/1): retryable")
+                && error.contains("event 2 (retry 1/1): retryable"),
+            "check_result returns the same safe summary: {error}"
+        );
+        assert!(
+            !error.contains("background primary failure marker")
+                && !error.contains("background backup failure marker"),
+            "provider-controlled response bodies must not reach check_result: {error}"
+        );
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert!(
+            !error.contains(&warning),
+            "terminal background errors must not become recovery warnings: {error}"
         );
     }
 
@@ -8381,6 +9787,170 @@ command = "echo hi"
             !result.output.contains("forbidden_tool_seen"),
             "target policy should have filtered out file_write, but got: {}",
             result.output
+        );
+    }
+
+    #[test]
+    fn resolve_brain_oauth_target_returns_none_credential() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut oauth_map = HashMap::new();
+        oauth_map.insert(
+            "codex".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: true,
+                api_key: None,
+                model: Some("gpt-4".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("openai".to_string(), oauth_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (provider_type, credential, model, _) = tool.resolve_brain("openai.codex");
+        assert_eq!(provider_type, "openai");
+        assert!(
+            credential.is_none(),
+            "OAuth target must not inherit global coordinator credential"
+        );
+        assert_eq!(model, "gpt-4");
+    }
+
+    #[test]
+    fn resolve_brain_oauth_target_preserves_explicit_alias_key() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut oauth_map = HashMap::new();
+        oauth_map.insert(
+            "codex".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: true,
+                api_key: Some("sk-codex-custom-gateway-key".to_string()),
+                model: Some("gpt-4".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("openai".to_string(), oauth_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (_provider_type, credential, _model, _) = tool.resolve_brain("openai.codex");
+        assert_eq!(
+            credential.as_deref(),
+            Some("sk-codex-custom-gateway-key"),
+            "OAuth target with explicit api_key must preserve the alias key"
+        );
+    }
+
+    #[test]
+    fn resolve_brain_non_oauth_fallback_preserved() {
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        let mut custom_map = HashMap::new();
+        custom_map.insert(
+            "local".to_string(),
+            ModelProviderConfig {
+                requires_openai_auth: false,
+                api_key: None,
+                model: Some("llama3".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        providers_models.insert("custom".to_string(), custom_map);
+
+        let tool = DelegateTool::new(
+            HashMap::new(),
+            Some("sk-ant-global-coordinator-key".to_string()),
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_providers_models(providers_models);
+
+        let (_provider_type, credential, _model, _) = tool.resolve_brain("custom.local");
+        assert_eq!(
+            credential.as_deref(),
+            Some("sk-ant-global-coordinator-key"),
+            "non-OAuth target without api_key must fall back to global credential"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_arc_ref_spec_tests {
+    use super::*;
+    use zeroclaw_api::tool::ToolSpec;
+
+    struct ArcSchemaTool {
+        schema: Arc<serde_json::Value>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ArcSchemaTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "arc-schema-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ArcSchemaTool {
+        fn name(&self) -> &str {
+            "arc_schema_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool with Arc-shared schema"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            (*self.schema).clone()
+        }
+
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name().to_string(),
+                description: self.description().to_string(),
+                parameters: Arc::clone(&self.schema),
+                output: None,
+                param_domains: std::collections::BTreeMap::new(),
+            }
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn tool_arc_ref_forwards_spec_arc_identity() {
+        let inner: Arc<dyn Tool> = Arc::new(ArcSchemaTool {
+            schema: Arc::new(serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            })),
+        });
+        let inner_params = inner.spec().parameters;
+        let wrapped = ToolArcRef::new(Arc::clone(&inner));
+
+        assert!(
+            Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
+            "ToolArcRef must forward spec() so the inner Arc-shared schema \
+             survives; the trait default deep-clones it every call"
         );
     }
 }

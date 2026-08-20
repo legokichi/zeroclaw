@@ -1,9 +1,4 @@
 //! Canonical hardware tool-name and capability catalog.
-//!
-//! Single source of truth for the names the agent sees and the docs render.
-//! `fn name()` impls and the mdBook hardware snippets both read these constants
-//! so a rename lands in one place and the rendered tables follow on the next
-//! docs build. Non-gated so xtask can walk it without the `hardware` feature.
 
 /// Built-in hardware tools always present with the `hardware` feature.
 pub const BASE_TOOLS: &[&str] = &[
@@ -13,16 +8,6 @@ pub const BASE_TOOLS: &[&str] = &[
     "device_read_code",
     "device_write_code",
     "device_exec",
-];
-
-/// Tools loaded only when at least one Aardvark adapter is present at boot.
-pub const AARDVARK_TOOLS: &[&str] = &[
-    "i2c_scan",
-    "i2c_read",
-    "i2c_write",
-    "spi_transfer",
-    "gpio_aardvark",
-    "datasheet",
 ];
 
 /// probe-rs backed introspection tools (in `zeroclaw-tools`).
@@ -43,12 +28,7 @@ mod tests {
 
     #[test]
     fn no_duplicate_tool_names_across_sets() {
-        let mut all: Vec<&str> = BASE_TOOLS
-            .iter()
-            .chain(AARDVARK_TOOLS)
-            .chain(PROBE_TOOLS)
-            .copied()
-            .collect();
+        let mut all: Vec<&str> = BASE_TOOLS.iter().chain(PROBE_TOOLS).copied().collect();
         let before = all.len();
         all.sort_unstable();
         all.dedup();
