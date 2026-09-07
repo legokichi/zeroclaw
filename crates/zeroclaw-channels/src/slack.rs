@@ -1631,6 +1631,82 @@ impl SlackChannel {
         matches!(subtype, None | Some("file_share" | "thread_broadcast"))
     }
 
+    /// Thread history is broader than live dispatch. Incoming Webhooks arrive as
+    /// `bot_message` and must not start a turn, but they are the parent the
+    /// agent needs when a human @-mentions the bot in that thread.
+    fn is_supported_thread_history_subtype(subtype: Option<&str>) -> bool {
+        Self::is_supported_message_subtype(subtype) || matches!(subtype, Some("bot_message"))
+    }
+
+    fn render_legacy_attachments(message: &serde_json::Value) -> Vec<String> {
+        let Some(attachments) = message
+            .get("attachments")
+            .and_then(|value| value.as_array())
+        else {
+            return Vec::new();
+        };
+
+        attachments
+            .iter()
+            .take(SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE)
+            .filter_map(Self::render_legacy_attachment)
+            .collect()
+    }
+
+    fn render_legacy_attachment(attachment: &serde_json::Value) -> Option<String> {
+        let title = attachment
+            .get("title")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let text = attachment
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        let mut parts = Vec::new();
+        if let Some(title) = title {
+            parts.push(title.to_string());
+        }
+        if let Some(text) = text {
+            parts.push(text.to_string());
+        }
+        if let Some(fields) = attachment.get("fields").and_then(|value| value.as_array()) {
+            for field in fields {
+                let field_title = field
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .unwrap_or("");
+                let field_value = field
+                    .get("value")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .unwrap_or("");
+                if field_title.is_empty() && field_value.is_empty() {
+                    continue;
+                }
+                if field_title.is_empty() {
+                    parts.push(field_value.to_string());
+                } else if field_value.is_empty() {
+                    parts.push(field_title.to_string());
+                } else {
+                    parts.push(format!("{field_title}: {field_value}"));
+                }
+            }
+        }
+        if parts.is_empty() {
+            let fallback = attachment
+                .get("fallback")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            parts.push(fallback.to_string());
+        }
+        Some(parts.join("\n"))
+    }
+
     fn compose_incoming_content(text: String, attachment_blocks: Vec<String>) -> Option<String> {
         let mut sections = Vec::new();
         if !text.trim().is_empty() {
@@ -1661,7 +1737,8 @@ impl SlackChannel {
             .and_then(|value| value.as_str())
             .unwrap_or_default();
         let normalized_text = Self::normalize_incoming_text(text, require_mention, bot_user_id)?;
-        let attachment_blocks = self.render_file_attachments(message).await;
+        let mut attachment_blocks = self.render_file_attachments(message).await;
+        attachment_blocks.extend(Self::render_legacy_attachments(message));
         let permalink_blocks = self.resolve_permalink_blocks(&normalized_text).await;
 
         // Thread context backfill: when this message is a reply in a thread
@@ -1737,7 +1814,7 @@ impl SlackChannel {
                     return false;
                 }
                 let subtype = message.get("subtype").and_then(|v| v.as_str());
-                if !Self::is_supported_message_subtype(subtype) {
+                if !Self::is_supported_thread_history_subtype(subtype) {
                     return false;
                 }
                 let user = message
@@ -1748,6 +1825,13 @@ impl SlackChannel {
                     return true;
                 }
                 if user.is_empty() {
+                    let has_bot_id = message
+                        .get("bot_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| !id.is_empty());
+                    if has_bot_id {
+                        return true;
+                    }
                     dropped_by_allow_list += 1;
                     return false;
                 }
@@ -2379,7 +2463,14 @@ impl SlackChannel {
             .or_else(|| message.get("bot_id"))
             .and_then(|value| value.as_str())
             .unwrap_or_default();
-        let sender = if user_id.is_empty() {
+        let sender = if let Some(username) = message
+            .get("username")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            username.to_string()
+        } else if user_id.is_empty() {
             "unknown".to_string()
         } else {
             self.resolve_sender_identity(user_id).await
@@ -2390,10 +2481,11 @@ impl SlackChannel {
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("[no text]");
-        let attachment_blocks = self.render_file_attachments(message).await;
+            .unwrap_or_default();
+        let mut attachment_blocks = self.render_file_attachments(message).await;
+        attachment_blocks.extend(Self::render_legacy_attachments(message));
         let content = Self::compose_incoming_content(text.to_string(), attachment_blocks)
-            .unwrap_or_else(|| text.to_string())
+            .unwrap_or_else(|| "[no text]".to_string())
             .replace('\n', " ");
         let prefix = if highlight { ">" } else { "-" };
         Some(format!("{prefix} {sender}: {content}"))
@@ -6583,6 +6675,56 @@ mod tests {
     }
 
     #[test]
+    fn render_legacy_attachments_flattens_title_text_and_fields() {
+        let message = serde_json::json!({
+            "text": "",
+            "attachments": [{
+                "color": "danger",
+                "title": ":warning: rds-example-SwapUsage state: ALARM",
+                "title_link": "https://example.invalid/alarm",
+                "text": "RDS SwapUsage",
+                "fallback": "RDS SwapUsage",
+                "fields": [
+                    {"title": "Project", "value": "Example", "short": true},
+                    {"title": "Region", "value": "ap-northeast-1", "short": true},
+                    {"title": "", "value": "", "short": true}
+                ]
+            }]
+        });
+        let blocks = SlackChannel::render_legacy_attachments(&message);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].contains(":warning: rds-example-SwapUsage state: ALARM"));
+        assert!(blocks[0].contains("RDS SwapUsage"));
+        assert!(blocks[0].contains("Project: Example"));
+        assert!(blocks[0].contains("Region: ap-northeast-1"));
+        assert_eq!(
+            blocks[0].matches("RDS SwapUsage").count(),
+            1,
+            "fallback must not duplicate title/text"
+        );
+    }
+
+    #[test]
+    fn render_legacy_attachments_uses_fallback_when_title_and_text_are_empty() {
+        let message = serde_json::json!({
+            "attachments": [{
+                "fallback": "sns notification body",
+                "title": "  ",
+                "text": ""
+            }]
+        });
+        let blocks = SlackChannel::render_legacy_attachments(&message);
+        assert_eq!(blocks, vec!["sns notification body".to_string()]);
+    }
+
+    #[test]
+    fn render_legacy_attachments_returns_empty_when_absent() {
+        assert!(
+            SlackChannel::render_legacy_attachments(&serde_json::json!({"text": "hi"})).is_empty()
+        );
+    }
+
+    #[test]
     fn parse_slack_permalink_accepts_standard_archives_link() {
         let parsed = SlackChannel::parse_slack_permalink(
             "https://acme.slack.com/archives/C12345678/p1712345678901234",
@@ -6649,6 +6791,16 @@ mod tests {
             "message_changed"
         )));
         assert!(!SlackChannel::is_supported_message_subtype(Some(
+            "channel_join"
+        )));
+        assert!(SlackChannel::is_supported_thread_history_subtype(None));
+        assert!(SlackChannel::is_supported_thread_history_subtype(Some(
+            "bot_message"
+        )));
+        assert!(!SlackChannel::is_supported_message_subtype(Some(
+            "bot_message"
+        )));
+        assert!(!SlackChannel::is_supported_thread_history_subtype(Some(
             "channel_join"
         )));
     }
@@ -10215,11 +10367,18 @@ mod tests {
             // Bot's own past reply — must pass through (useful self-context).
             serde_json::json!({"ts": "T_R4", "thread_ts": "T_PARENT", "user": "U_BOT", "text": "bot turn"}),
             serde_json::json!({"ts": "T_R5", "thread_ts": "T_PARENT", "text": "from a webhook"}),
-            // Same situation with a `bot_id` instead of `user` (some
-            // integration messages carry `bot_id` instead of `user`).
-            // Filter only inspects `user`, so `bot_id`-only messages
-            // also fall under the userless drop.
+            // Incoming webhooks and some integrations carry `bot_id` instead of
+            // `user`. Keep them as thread context; live dispatch still ignores
+            // them because they have no allow-listed user.
             serde_json::json!({"ts": "T_R6", "thread_ts": "T_PARENT", "bot_id": "B999", "text": "from a bot integration"}),
+            serde_json::json!({
+                "ts": "T_R7",
+                "thread_ts": "T_PARENT",
+                "subtype": "bot_message",
+                "bot_id": "B_HOOK",
+                "username": "CloudWatch Alarm",
+                "text": "",
+            }),
             // The triggering reply itself — must be dropped to avoid
             // duplication in the agent payload.
             serde_json::json!({"ts": "T_TRIGGER", "thread_ts": "T_PARENT", "user": "U_USER", "text": "hi bot"}),
@@ -10236,11 +10395,11 @@ mod tests {
             .collect();
         assert_eq!(
             kept_ts,
-            vec!["T_PARENT", "T_R1", "T_R4"],
-            "trigger, subtype, userless, and non-allow-listed messages must be dropped",
+            vec!["T_PARENT", "T_R1", "T_R4", "T_R6", "T_R7"],
+            "trigger, system subtypes, userless, and non-allow-listed messages must be dropped",
         );
         assert_eq!(
-            dropped, 3,
+            dropped, 2,
             "non-allow-listed and userless messages all count toward the gap marker",
         );
     }
