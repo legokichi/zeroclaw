@@ -65,6 +65,7 @@ pub use zeroclaw_tools::file_upload::FileUploadTool;
 pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
 pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
+pub use zeroclaw_tools::grok_cli::GrokCliTool;
 pub use zeroclaw_tools::git_forge::GitForgeTool;
 pub use zeroclaw_tools::git_operations::GitOperationsTool;
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
@@ -1430,6 +1431,14 @@ pub fn all_tools_with_runtime(
                 root_config.opencode_cli.clone(),
                 coding_cli_executor.clone(),
             ),
+            security.clone(),
+        )));
+    }
+
+    // Grok Build CLI delegation tool
+    if root_config.grok_cli.enabled {
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
+            GrokCliTool::new(security.clone(), root_config.grok_cli.clone()),
             security.clone(),
         )));
     }
