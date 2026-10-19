@@ -98,6 +98,9 @@ with the earlier discussion. `thread_context_max_messages` controls how many of
 the newest prior messages available within the fetch window are included while
 preserving chronological order. The default is `0`, the maximum is `50`, and
 `0` disables this automatic hydration. Set an explicit nonzero value to opt in.
+Incoming Webhook posts (`bot_message`, often with empty `text` and a legacy
+`attachments` payload) are included in that block. Live dispatch still skips
+`bot_message` events, so those posts do not start a turn on their own.
 
 One hydration makes at most three total `conversations.replies` attempts,
 including retries after HTTP 429 responses. ZeroClaw honors Slack's `Retry-After`
