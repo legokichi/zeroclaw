@@ -287,6 +287,16 @@ const SLACK_HISTORY_MAX_JITTER_MS: u64 = 500;
 const SLACK_SOCKET_MODE_INITIAL_BACKOFF_SECS: u64 = 3;
 const SLACK_SOCKET_MODE_MAX_BACKOFF_SECS: u64 = 120;
 const SLACK_SOCKET_MODE_MAX_JITTER_MS: u64 = 500;
+/// Client websocket ping period. A half-open socket stays ESTAB and `read`
+/// blocks until some inbound frame arrives, so the client has to write.
+const SLACK_SOCKET_MODE_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Reconnect after this much silence. Three ping intervals: one late pong
+/// does not cycle the socket. Slack's own server-ping budget is 30s.
+const SLACK_SOCKET_MODE_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn socket_mode_should_reconnect_for_idle(last_frame_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_frame_at) >= SLACK_SOCKET_MODE_IDLE_TIMEOUT
+}
 const SLACK_USER_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
 const SLACK_ATTACHMENT_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES: usize = 512 * 1024;
@@ -4295,8 +4305,28 @@ impl SlackChannel {
             );
 
             let (mut write, mut read) = ws_stream.split();
+            let mut last_frame = Instant::now();
+            let mut ping_interval = tokio::time::interval(SLACK_SOCKET_MODE_PING_INTERVAL);
+            ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // `interval` completes its first tick immediately. Consume that
+            // tick so the first ping waits out a full period.
+            ping_interval.tick().await;
 
-            while let Some(frame) = read.next().await {
+            loop {
+                tokio::select! {
+                    biased;
+
+                    frame = read.next() => {
+                let Some(frame) = frame else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "Socket Mode: websocket closed"
+                    );
+                    break;
+                };
+                last_frame = Instant::now();
                 let text = match frame {
                     Ok(WsMessage::Text(text)) => text,
                     Ok(WsMessage::Ping(payload)) => {
@@ -4627,6 +4657,38 @@ impl SlackChannel {
 
                 if tx.send(channel_msg).await.is_err() {
                     return Ok(());
+                }
+                    }
+                    _ = ping_interval.tick() => {
+                        if socket_mode_should_reconnect_for_idle(last_frame, Instant::now()) {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "idle_timeout_secs": SLACK_SOCKET_MODE_IDLE_TIMEOUT.as_secs(),
+                                })),
+                                "Socket Mode: no frame within idle timeout, reconnecting"
+                            );
+                            break;
+                        }
+                        if let Err(e) = write.send(WsMessage::Ping(Vec::new().into())).await {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "Socket Mode: ping send failed"
+                            );
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -7820,6 +7882,19 @@ mod tests {
                 "unexpected temp artifact left behind: {name}"
             );
         }
+    }
+
+    #[test]
+    fn socket_mode_idle_reconnects_after_three_silent_ping_intervals() {
+        let start = Instant::now();
+        assert!(!socket_mode_should_reconnect_for_idle(
+            start,
+            start + SLACK_SOCKET_MODE_PING_INTERVAL * 2
+        ));
+        assert!(socket_mode_should_reconnect_for_idle(
+            start,
+            start + SLACK_SOCKET_MODE_IDLE_TIMEOUT
+        ));
     }
 
     #[test]
